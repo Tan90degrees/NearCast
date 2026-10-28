@@ -10,6 +10,7 @@ import io.nearcast.app.capture.VideoCodec
 import io.nearcast.app.capture.VideoTransport
 import io.nearcast.app.network.HostServer
 import io.nearcast.app.network.NearbyDiscovery
+import io.nearcast.app.network.WifiDirectController
 import io.nearcast.app.network.RemoteClient
 import kotlinx.coroutines.flow.MutableStateFlow
 
@@ -21,6 +22,8 @@ object NearCastRuntime {
     @Volatile var host: HostServer? = null
         private set
     @Volatile var discovery: NearbyDiscovery? = null
+        private set
+    @Volatile var wifiDirect: WifiDirectController? = null
         private set
     @Volatile var dimScreen: DimScreen? = null
         private set
@@ -47,6 +50,7 @@ object NearCastRuntime {
         val server = HostServer(app)
         host = server
         discovery = NearbyDiscovery(app).also { it.start(server.port) }
+        wifiDirect = WifiDirectController(app)
         Thread({
             try {
                 val results = CodecProbe.scan()

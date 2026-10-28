@@ -48,8 +48,18 @@ object Wire {
 }
 
 class HostServer(private val context: Context) {
+    companion object {
+        // Fixed port allows Wi-Fi Direct group members to connect without
+        // relying on multicast/mDNS (often unavailable on P2P interfaces).
+        const val DIRECT_PORT = 39491
+    }
     val pin: String = (100000 + SecureRandom().nextInt(900000)).toString()
-    private val server = ServerSocket(0)
+    private val server = try {
+        ServerSocket(DIRECT_PORT)
+    } catch (e: java.io.IOException) {
+        Log.w("NearCastHost", "Direct port busy; falling back to dynamic LAN port", e)
+        ServerSocket(0)
+    }
     val port: Int = server.localPort
     val connected = MutableStateFlow(false)
     val status = MutableStateFlow("等待同一 Wi-Fi 下的设备连接")

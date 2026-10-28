@@ -89,7 +89,10 @@ class UdpVideoReceiver(
     }
     val localPort: Int get() = socket.localPort
     private val running = AtomicBoolean(true)
+    private data class Complete(val flags: Int, val pts: Long,
+                                val data: ByteArray, val receivedAtMs: Long)
     private val pending = HashMap<Int, Assembly>()
+    private val completed = java.util.TreeMap<Int, Complete>()
     private var lastDelivered = -1
     private var waitForKeyframe = true
     private var lastTraffic = SystemClock.elapsedRealtime()
@@ -118,6 +121,7 @@ class UdpVideoReceiver(
                 val expired = pending.filterValues { now - it.startMs > 100 }.keys
                 if (expired.isNotEmpty()) {
                     expired.forEach { pending.remove(it) }
+                    completed.clear()
                     waitForKeyframe = true
                     requestKeyframe()
                 }
@@ -135,6 +139,7 @@ class UdpVideoReceiver(
                 // Bound memory under corrupt/reordered datagrams.
                 if (pending.size > 12) {
                     pending.clear()
+                    completed.clear()
                     waitForKeyframe = true
                     requestKeyframe()
                     continue
@@ -147,20 +152,35 @@ class UdpVideoReceiver(
                 when {
                     flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0 ->
                         onVideo(flags, pts, bytes)
-                    flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 -> {
-                        waitForKeyframe = false
-                        lastDelivered = id
-                        pending.clear()
-                        onVideo(flags, pts, bytes)
+                    waitForKeyframe -> {
+                        if (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) {
+                            waitForKeyframe = false
+                            lastDelivered = id
+                            pending.clear()
+                            completed.clear()
+                            onVideo(flags, pts, bytes)
+                        }
                     }
-                    waitForKeyframe -> Unit
-                    id == lastDelivered + 1 -> {
-                        lastDelivered = id
-                        onVideo(flags, pts, bytes)
-                    }
+                    id <= lastDelivered -> Unit
                     else -> {
-                        waitForKeyframe = true
-                        requestKeyframe()
+                        // UDP frames may finish out-of-order. Keep a tiny
+                        // reorder window instead of resetting the GOP at
+                        // the very first reordered packet.
+                        completed[id] = Complete(flags, pts, bytes, now)
+                        while (true) {
+                            val next = completed.remove(lastDelivered + 1) ?: break
+                            lastDelivered++
+                            onVideo(next.flags, next.pts, next.data)
+                        }
+                        if (completed.isNotEmpty()) {
+                            val oldest = completed.values.first().receivedAtMs
+                            if (completed.size > 4 || now - oldest > 25) {
+                                completed.clear()
+                                pending.clear()
+                                waitForKeyframe = true
+                                requestKeyframe()
+                            }
+                        }
                     }
                 }
             } catch (_: SocketTimeoutException) {
@@ -179,6 +199,7 @@ class UdpVideoReceiver(
         if (!running.getAndSet(false)) return
         socket.close()
         pending.clear()
+        completed.clear()
         if (Thread.currentThread() !== reader) {
             try { reader.join(300) }
             catch (_: InterruptedException) { Thread.currentThread().interrupt() }

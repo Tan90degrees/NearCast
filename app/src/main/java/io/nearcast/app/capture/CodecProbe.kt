@@ -95,6 +95,7 @@ object CodecProbe {
     private fun startup(name: String, mime: String, encode: Boolean, fps: Int): Pair<Boolean, String> {
         var codec: MediaCodec? = null
         var surface: android.view.Surface? = null
+        var outputTexture: android.graphics.SurfaceTexture? = null
         var started = false
         return try {
             val format = MediaFormat.createVideoFormat(mime, 720, 1280)
@@ -110,7 +111,14 @@ object CodecProbe {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
             codec = MediaCodec.createByCodecName(name)
-            codec.configure(format, null, null,
+            if (!encode) {
+                // Most modern video decoders are optimized for Surface output.
+                // Testing a null (ByteBuffer) output Surface can falsely fail
+                // for AV1/HEVC hardware codecs that support only Surface mode.
+                outputTexture = android.graphics.SurfaceTexture(false)
+                surface = android.view.Surface(outputTexture)
+            }
+            codec.configure(format, if (encode) null else surface, null,
                 if (encode) MediaCodec.CONFIGURE_FLAG_ENCODE else 0)
             if (encode) surface = codec.createInputSurface()
             codec.start()
@@ -124,6 +132,7 @@ object CodecProbe {
             if (started) try { codec?.stop() } catch (_: Exception) {}
             try { codec?.release() } catch (_: Exception) {}
             try { surface?.release() } catch (_: Exception) {}
+            try { outputTexture?.release() } catch (_: Exception) {}
         }
     }
 

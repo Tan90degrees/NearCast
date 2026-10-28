@@ -151,7 +151,7 @@ class HostServer(private val context: Context) {
         private val pending = ArrayBlockingQueue<Packet>(48)
         private var writer: Thread? = null
         private var header: Packet.Size? = null
-        private var cachedConfig: Packet.Video? = null
+        private val cachedConfig = ArrayList<Packet.Video>()
         private var waitingKeyframe = false
 
         fun startWriter() {
@@ -191,6 +191,7 @@ class HostServer(private val context: Context) {
         @Synchronized fun sendSize(width: Int, height: Int, mime: String) {
             val next = Packet.Size(width, height, mime)
             header = next
+            cachedConfig.clear()
             pending.clear()
             waitingKeyframe = true
             pending.offer(next)
@@ -200,14 +201,17 @@ class HostServer(private val context: Context) {
             if (!open.get() || data.size > Wire.MAX_FRAME) return
             val pkt = Packet.Video(flags, ptsUs, data)
             if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                cachedConfig = pkt
+                if (cachedConfig.none { it.bytes.contentEquals(data) }) {
+                    if (cachedConfig.size >= 4) cachedConfig.removeAt(0)
+                    cachedConfig.add(pkt)
+                }
                 if (!waitingKeyframe) pending.offer(pkt)
                 return
             }
             val key = flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
             if (waitingKeyframe) {
                 if (!key) return
-                cachedConfig?.let { pending.offer(it) }
+                cachedConfig.forEach { pending.offer(it) }
                 waitingKeyframe = false
             }
             if (pending.offer(pkt)) return
@@ -248,7 +252,8 @@ class RemoteClient {
     @Volatile private var audio: PlaybackAudioRenderer? = null
     @Volatile private var surface: Surface? = null
     @Volatile private var dimensions: Triple<Int, Int, String>? = null
-    @Volatile private var codecConfig: ByteArray? = null
+    private val codecConfigs = ArrayList<ByteArray>()
+    @Volatile private var configApplied = false
     @Volatile private var needKeyframe = true
     private val sendLock = Any()
     private var lastSyncMs = 0L
@@ -290,7 +295,8 @@ class RemoteClient {
                             val newSize = Triple(w, h, mime)
                             if (dimensions != newSize) {
                                 dimensions = newSize
-                                codecConfig = null
+                                codecConfigs.clear()
+                                configApplied = false
                                 needKeyframe = true
                                 videoSize.value = w to h
                                 codecName.value = when (mime) {
@@ -310,8 +316,14 @@ class RemoteClient {
                             val data = ByteArray(len)
                             reader.readFully(data)
                             if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                                codecConfig = data.copyOf()
-                                decoder?.queue(flags, pts, data)
+                                if (codecConfigs.none { it.contentEquals(data) }) {
+                                    if (codecConfigs.size >= 4) codecConfigs.removeAt(0)
+                                    codecConfigs.add(data.copyOf())
+                                }
+                                val current = decoder
+                                if (current != null && current.queue(flags, pts, data)) {
+                                    configApplied = true
+                                }
                             } else {
                                 if (needKeyframe) {
                                     if (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME == 0) continue
@@ -319,8 +331,13 @@ class RemoteClient {
                                     // parameter sets before accepting the IDR.
                                     val current = decoder
                                     if (current == null) continue
-                                    codecConfig?.let {
-                                        current.queue(MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0, it)
+                                    if (!configApplied) {
+                                        var applied = true
+                                        codecConfigs.forEach {
+                                            if (!current.queue(MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0, it))
+                                                applied = false
+                                        }
+                                        configApplied = applied
                                     }
                                     needKeyframe = false
                                 }
@@ -366,6 +383,7 @@ class RemoteClient {
             null
         }
         needKeyframe = true
+        configApplied = false
         requestSync()
     }
 
@@ -376,6 +394,7 @@ class RemoteClient {
             // The next surface MUST get its own codec and fresh IDR.
             decoder?.close()
             decoder = null
+            configApplied = false
             needKeyframe = true
         } else createDecoderIfReady()
     }
@@ -428,7 +447,8 @@ class RemoteClient {
         audio?.close()
         audio = null
         dimensions = null
-        codecConfig = null
+        codecConfigs.clear()
+        configApplied = false
         needKeyframe = true
         connected.value = false
     }

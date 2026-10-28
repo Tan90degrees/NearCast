@@ -26,6 +26,8 @@ object CodecProbe {
         val decoding60: Boolean = false,
         val encoderCandidates: String = "",
         val decoderCandidates: String = "",
+        val vendorEncoder: Boolean = false,
+        val softwareEncoder: Boolean = false,
         val encodeStartup: Boolean? = null,
         val decodeStartup: Boolean? = null,
         val details: String = ""
@@ -37,8 +39,7 @@ object CodecProbe {
     }
 
     private fun hw(info: MediaCodecInfo): Boolean =
-        if (Build.VERSION.SDK_INT >= 29)
-            !info.isSoftwareOnly && (info.isHardwareAccelerated || info.isVendor)
+        if (Build.VERSION.SDK_INT >= 29) info.isHardwareAccelerated && !info.isSoftwareOnly
         else !info.name.startsWith("OMX.google.", true) &&
             !info.name.startsWith("c2.android.", true)
 
@@ -77,7 +78,9 @@ object CodecProbe {
             enc?.let { supported(it, format.mime, 60) } ?: false,
             dec?.let { supported(it, format.mime, 60) } ?: false,
             encoders.joinToString { it.name },
-            decoders.joinToString { it.name }
+            decoders.joinToString { it.name },
+            Build.VERSION.SDK_INT >= 29 && enc?.isVendor == true,
+            Build.VERSION.SDK_INT >= 29 && enc?.isSoftwareOnly == true
         )
     }
 

@@ -360,7 +360,9 @@ private fun NearCastApp(
                 VideoCodec.entries.forEach { value ->
                     val local = codecResults.firstOrNull { it.codec == value }
                     val localEncoderOk = local?.encoder != null && local.surfaceEncoder &&
-                        (value != VideoCodec.AV1 || local.hardwareEncoder) &&
+                        (value != VideoCodec.AV1 ||
+                            local.hardwareEncoder ||
+                            (local.vendorEncoder && !local.softwareEncoder)) &&
                         local.encodeStartup != false
                     val peerOk = !hostConnected || CodecProbe.supports(peerMask, value)
                     FilterChip(
@@ -380,7 +382,10 @@ private fun NearCastApp(
                     else -> "尚未实测初始化"
                 }
                 Text(item.codec.label + " · 编码 " + encoderText +
-                    (if (item.hardwareEncoder) " [HW]" else " [SW/未知]") +
+                    (if (item.hardwareEncoder) " [硬件]"
+                    else if (item.softwareEncoder) " [软件]"
+                    else if (item.vendorEncoder) " [厂商实现，硬件未确认]"
+                    else " [类型未知]") +
                     " · 解码 " + decoderText +
                     (if (item.hardwareDecoder) " [HW]" else " [SW/未知]") +
                     " · 720p60 " + (if (item.encoding60) "声明支持" else "未声明支持") +
@@ -389,8 +394,8 @@ private fun NearCastApp(
                     style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
                 if (item.codec == VideoCodec.AV1 && item.encoder != null &&
                     !item.hardwareEncoder) Text(
-                    "检测到 AV1 编码器，但它未被识别为适合低时延的硬件编码器，" +
-                        "因此自动选择时不启用；并不意味着手机完全不支持 AV1。",
+                    "检测到 AV1 编码器，但硬件加速属性未确认。" +
+                        "厂商实现会尝试初始化，软件实现不会用于低时延远控。",
                     style = MaterialTheme.typography.bodySmall, color = Color.LightGray
                 )
                 if (item.details.isNotEmpty()) Text(item.details,

@@ -184,9 +184,9 @@ class WifiDirectController(context: Context) {
         val c = channel ?: return
         if (!hasPermission()) return
         p2p.requestConnectionInfo(c) { info ->
-            if (info != null && info.groupFormed && info.groupOwnerAddress != null) {
-                val address = info.groupOwnerAddress.hostAddress.orEmpty()
-                if (address.isNotEmpty()) {
+            if (info != null && info.groupFormed) {
+                val address = info.groupOwnerAddress?.hostAddress.orEmpty()
+                if (info.isGroupOwner || address.isNotBlank()) {
                     link.value = Link(info.isGroupOwner, address)
                     status.value = if (info.isGroupOwner)
                         "直连组已创建 · 本机为被控端，等待控制端连接"

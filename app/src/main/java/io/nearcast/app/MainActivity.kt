@@ -356,6 +356,16 @@ private fun NearCastApp(
                 "%.1f".format(encoderMbps) + " Mbps · 帧间隔 " +
                 "%.1f".format(frameInterval) + "±" + "%.1f".format(frameJitter) + "ms",
                 style = MaterialTheme.typography.bodySmall, color = Aqua)
+            if (captureActive && fps >= 90 &&
+                ((sourceHz > 0 && sourceHz < fps * 0.8f) ||
+                    (encoderFps in 1 until (fps * 0.8f).toInt()))) {
+                Text("当前 App / 系统可能已降到 " + sourceHz.toInt() +
+                    "Hz，实际新画面不足 " + fps +
+                    " FPS。编码器目标不会强制第三方 App 维持高刷新率；" +
+                    "不会用重复帧冒充 120 FPS。",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall)
+            }
             Text("网络写出 " + "%.1f".format(wireMbps) + " Mbps · 发送排队 " +
                 writerDepth + " 帧 · GOP 重同步 " + dropped,
                 style = MaterialTheme.typography.bodySmall, color = Color.LightGray)

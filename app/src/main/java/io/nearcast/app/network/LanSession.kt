@@ -15,6 +15,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.MessageDigest
+import kotlin.math.abs
 import java.security.SecureRandom
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
@@ -33,6 +34,8 @@ object Wire {
     const val SYNC = 4
     const val AUDIO = 5
     const val UDP_PORT = 6
+    const val PING = 7
+    const val PONG = 8
     const val TAP = 1
     const val SWIPE = 2
     const val BACK = 3
@@ -115,6 +118,10 @@ class HostServer(private val context: Context) {
                                 RemoteInputService.dispatch(action, x1, y1, x2, y2, duration)
                         }
                         Wire.SYNC -> if (link === current) onNeedKeyframe?.invoke()
+                        Wire.PING -> {
+                            val sentTimeMs = input.readLong()
+                            if (link === current) link.pong(sentTimeMs)
+                        }
                         Wire.UDP_PORT -> {
                             val port = input.readInt()
                             if (link === current && port in 1..65535) {
@@ -163,6 +170,7 @@ class HostServer(private val context: Context) {
         ) : Packet()
         data class Video(val flags: Int, val ptsUs: Long, val bytes: ByteArray) : Packet()
         data class Audio(val bytes: ByteArray) : Packet()
+        data class Pong(val timestamp: Long) : Packet()
     }
 
     private class HostLink(
@@ -215,11 +223,16 @@ class HostServer(private val context: Context) {
                                 output.writeInt(item.bytes.size)
                                 output.write(item.bytes)
                             }
+                            is Packet.Pong -> {
+                                output.writeByte(Wire.PONG)
+                                output.writeLong(item.timestamp)
+                            }
                         }
                         windowBytes += when (item) {
                             is Packet.Video -> item.bytes.size.toLong()
                             is Packet.Audio -> item.bytes.size.toLong()
                             is Packet.Size -> 32L
+                            is Packet.Pong -> 9L
                         }
                         val now = SystemClock.elapsedRealtime()
                         if (now - statsMs >= 1000L) {
@@ -284,6 +297,10 @@ class HostServer(private val context: Context) {
             requestSync()
         }
 
+        fun pong(timestampMs: Long) {
+            if (open.get()) pending.offer(Packet.Pong(timestampMs))
+        }
+
         @Synchronized fun sendAudio(data: ByteArray) {
             if (!open.get() || data.size > Wire.MAX_AUDIO) return
             // Audio is best-effort; never evict video for it.
@@ -312,6 +329,9 @@ class RemoteClient {
     val decodeQueueDepth = MutableStateFlow(0)
     val videoQueueOverflows = MutableStateFlow(0L)
     val recoveryRequests = MutableStateFlow(0L)
+    val controlRttMs = MutableStateFlow(0)
+    val controlJitterMs = MutableStateFlow(0)
+    private var previousRttMs = 0
     private var frameWindowMs = SystemClock.elapsedRealtime()
     private var windowFrames = 0
     private data class VideoUnit(val flags: Int, val pts: Long, val bytes: ByteArray)
@@ -385,6 +405,16 @@ class RemoteClient {
                 output = writer
                 connected.value = true
                 status.value = "已连接 · 等待对方开始共享"
+                Thread({
+                    while (running.get() && socket === s && !s.isClosed) {
+                        val sentAt = SystemClock.elapsedRealtime()
+                        sendCommand(Wire.PING) {
+                            writer.writeLong(sentAt)
+                        }
+                        try { Thread.sleep(1000) }
+                        catch (_: InterruptedException) { break }
+                    }
+                }, "NearCast-control-ping").apply { isDaemon = true; start() }
                 while (running.get()) {
                     when (reader.readUnsignedByte()) {
                         Wire.SIZE -> {
@@ -446,6 +476,16 @@ class RemoteClient {
                             val data = ByteArray(len)
                             reader.readFully(data)
                             receiveVideo(flags, pts, data)
+                        }
+                        Wire.PONG -> {
+                            val sentAt = reader.readLong()
+                            val rtt = (SystemClock.elapsedRealtime() - sentAt).coerceIn(0, 60_000).toInt()
+                            if (previousRttMs > 0) {
+                                controlJitterMs.value =
+                                    (controlJitterMs.value * 0.8 + abs(rtt - previousRttMs) * 0.2).toInt()
+                            }
+                            previousRttMs = rtt
+                            controlRttMs.value = rtt
                         }
                         Wire.AUDIO -> {
                             val len = reader.readInt()
@@ -636,6 +676,9 @@ class RemoteClient {
         dimensions = null
         receivedFps.value = 0
         renderedFps.value = 0
+        controlRttMs.value = 0
+        controlJitterMs.value = 0
+        previousRttMs = 0
         connected.value = false
     }
 }

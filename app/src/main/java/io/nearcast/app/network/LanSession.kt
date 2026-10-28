@@ -360,6 +360,7 @@ class RemoteClient {
     val decodedFrames = MutableStateFlow(0L)
     val receivedFps = MutableStateFlow(0)
     val renderedFps = MutableStateFlow(0)
+    val lowestLatencyRender = MutableStateFlow(true)
     val receiveMbps = MutableStateFlow(0.0)
     val decodeQueueDepth = MutableStateFlow(0)
     val videoQueueOverflows = MutableStateFlow(0L)
@@ -628,7 +629,10 @@ class RemoteClient {
             videoQueue.clear()
             decoder?.close()
             decoder = try {
-                AvcSurfaceDecoder(target, dims.first, dims.second, dims.third) {
+                AvcSurfaceDecoder(
+                    target, dims.first, dims.second, dims.third,
+                    { lowestLatencyRender.value }
+                ) {
                     countRenderedOutput()
                 }
             } catch (e: Exception) {

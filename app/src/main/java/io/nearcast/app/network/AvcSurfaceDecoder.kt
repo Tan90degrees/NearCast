@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /** Video decoder with explicitly owned input/output lifecycle and MIME negotiation. */
 class AvcSurfaceDecoder(surface: Surface, width: Int, height: Int,
                         mime: String = MediaFormat.MIMETYPE_VIDEO_AVC,
+                        private val lowLatencyMode: () -> Boolean = { true },
                         private val onDecodedOutput: () -> Unit = {}) {
     private val codec = MediaCodec.createDecoderByType(mime)
     private val running = AtomicBoolean(true)
@@ -34,8 +35,26 @@ class AvcSurfaceDecoder(surface: Surface, width: Int, height: Int,
                 try {
                     val index = codec.dequeueOutputBuffer(info, 5000)
                     if (index >= 0) {
-                        codec.releaseOutputBuffer(index, true)
-                        if (info.size > 0) onDecodedOutput()
+                        var displayIndex = index
+                        var displaySize = info.size
+                        if (lowLatencyMode()) {
+                            // Moonlight-style "latest ready frame": decoding is
+                            // finished, so discarded *output* buffers do not
+                            // affect inter-frame prediction, unlike dropping
+                            // compressed P frames. Avoid building a long
+                            // display backlog when decode is bursty.
+                            var skipped = 0
+                            while (skipped < 4) {
+                                val newer = codec.dequeueOutputBuffer(info, 0)
+                                if (newer < 0) break
+                                codec.releaseOutputBuffer(displayIndex, false)
+                                displayIndex = newer
+                                displaySize = info.size
+                                skipped++
+                            }
+                        }
+                        codec.releaseOutputBuffer(displayIndex, true)
+                        if (displaySize > 0) onDecodedOutput()
                     }
                 } catch (e: Exception) {
                     if (running.get()) Log.w("NearCastDecoder", "Decode output failed", e)

@@ -155,6 +155,7 @@ internal fun RemoteViewer(onClose: () -> Unit) {
     var showQuality by remember { mutableStateOf(false) }
     var showDiagnostics by remember { mutableStateOf(false) }
     val bitrate by client.bitrateLimitMbps.collectAsState()
+    val lowestLatency by client.lowestLatencyRender.collectAsState()
     var bitrateSlider by remember(bitrate) { mutableFloatStateOf(bitrate.toFloat()) }
 
     DisposableEffect(immersive) {
@@ -297,6 +298,16 @@ internal fun RemoteViewer(onClose: () -> Unit) {
                         onValueChangeFinished = {
                             client.setBitrateLimit(bitrateSlider.toInt())
                         }, valueRange = 2f..60f, steps = 57)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("最低延迟画面节奏")
+                            Text("跳过堆积的已解码旧画面，避免显示队列拉长。" +
+                                "关闭时按顺序呈现，可能更平滑但延迟更高。",
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                        Switch(checked = lowestLatency,
+                            onCheckedChange = { client.lowestLatencyRender.value = it })
+                    }
                     Text("客户端可实时调整编码器码率目标；实际码率随画面内容变化。" +
                         "降低码率可缓解突发发送、网络及解码积压。",
                         style = MaterialTheme.typography.bodySmall)

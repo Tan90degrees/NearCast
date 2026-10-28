@@ -148,7 +148,7 @@ class ScreenEncoder(
                 it.isEncoder && it.supportedTypes.any { type -> type.equals(mime, true) } &&
                     (mime != "video/av01" ||
                         (Build.VERSION.SDK_INT >= 29 &&
-                            it.isHardwareAccelerated && !it.isSoftwareOnly))
+                            !it.isSoftwareOnly && (it.isHardwareAccelerated || it.isVendor)))
             }.sortedByDescending {
                 if (Build.VERSION.SDK_INT >= 29 && it.isHardwareAccelerated) 1 else 0
             }

@@ -383,9 +383,16 @@ private fun NearCastApp(
                     (if (item.hardwareEncoder) " [HW]" else " [SW/未知]") +
                     " · 解码 " + decoderText +
                     (if (item.hardwareDecoder) " [HW]" else " [SW/未知]") +
-                    " · 720p120 编码声明 " + (if (item.encoding120) "支持" else "不支持") +
+                    " · 720p60 " + (if (item.encoding60) "声明支持" else "未声明支持") +
+                    " / 720p120 " + (if (item.encoding120) "声明支持" else "未声明支持") +
                     " · " + activeStatus,
                     style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                if (item.codec == VideoCodec.AV1 && item.encoder != null &&
+                    !item.hardwareEncoder) Text(
+                    "检测到 AV1 编码器，但它未被识别为适合低时延的硬件编码器，" +
+                        "因此自动选择时不启用；并不意味着手机完全不支持 AV1。",
+                    style = MaterialTheme.typography.bodySmall, color = Color.LightGray
+                )
                 if (item.details.isNotEmpty()) Text(item.details,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error)

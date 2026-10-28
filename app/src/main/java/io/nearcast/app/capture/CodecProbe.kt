@@ -22,16 +22,23 @@ object CodecProbe {
         val surfaceEncoder: Boolean,
         val encoding120: Boolean,
         val decoding120: Boolean,
+        val encoding60: Boolean = false,
+        val decoding60: Boolean = false,
+        val encoderCandidates: String = "",
+        val decoderCandidates: String = "",
         val encodeStartup: Boolean? = null,
         val decodeStartup: Boolean? = null,
         val details: String = ""
     ) {
-        val usable: Boolean get() = encoder != null && decoder != null && surfaceEncoder &&
-            (codec != VideoCodec.AV1 || (hardwareEncoder && hardwareDecoder))
+        // Availability != suitability for high-FPS screen streaming.
+        val available: Boolean get() = encoder != null || decoder != null
+        val lowLatencyCandidate: Boolean get() = encoder != null &&
+            decoder != null && surfaceEncoder && hardwareEncoder && hardwareDecoder
     }
 
     private fun hw(info: MediaCodecInfo): Boolean =
-        if (Build.VERSION.SDK_INT >= 29) info.isHardwareAccelerated && !info.isSoftwareOnly
+        if (Build.VERSION.SDK_INT >= 29)
+            !info.isSoftwareOnly && (info.isHardwareAccelerated || info.isVendor)
         else !info.name.startsWith("OMX.google.", true) &&
             !info.name.startsWith("c2.android.", true)
 
@@ -54,18 +61,23 @@ object CodecProbe {
         } catch (_: Exception) { false }
 
     fun scan(): List<Item> = VideoCodec.entries.map { format ->
-        val enc = candidates(format.mime, true).firstOrNull {
-            surface(it, format.mime) && (format != VideoCodec.AV1 || hw(it))
-        }
-        val dec = candidates(format.mime, false).firstOrNull {
-            format != VideoCodec.AV1 || hw(it)
-        }
+        val encoders = candidates(format.mime, true)
+        val decoders = candidates(format.mime, false)
+        // Do NOT hide a codec just because it is software-only or the vendor
+        // omitted the HW flag. Advertise it, mark HW/SW separately.
+        val enc = encoders.firstOrNull { surface(it, format.mime) }
+            ?: encoders.firstOrNull()
+        val dec = decoders.firstOrNull()
         Item(
             format, enc?.name, dec?.name,
             enc?.let(::hw) ?: false, dec?.let(::hw) ?: false,
             enc?.let { surface(it, format.mime) } ?: false,
             enc?.let { supported(it, format.mime, 120) } ?: false,
-            dec?.let { supported(it, format.mime, 120) } ?: false
+            dec?.let { supported(it, format.mime, 120) } ?: false,
+            enc?.let { supported(it, format.mime, 60) } ?: false,
+            dec?.let { supported(it, format.mime, 60) } ?: false,
+            encoders.joinToString { it.name },
+            decoders.joinToString { it.name }
         )
     }
 
@@ -113,8 +125,9 @@ object CodecProbe {
     }
 
     fun decoderMask(items: List<Item>): Int = items.fold(0) { mask, item ->
-        if (item.decoder != null && (item.codec != VideoCodec.AV1 || item.hardwareDecoder))
-            mask or (1 shl item.codec.ordinal) else mask
+        // Advertise actual decoding availability, including software AV1,
+        // but let sender's encoder policy avoid software encoders.
+        if (item.decoder != null) mask or (1 shl item.codec.ordinal) else mask
     }
 
     fun supports(mask: Int, codec: VideoCodec): Boolean =

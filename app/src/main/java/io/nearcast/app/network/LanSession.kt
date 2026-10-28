@@ -389,8 +389,9 @@ class RemoteClient {
         videoQueueOverflows.value = 0
         status.value = "正在连接 " + peer.name
         Thread({
+            val session = Socket()
             try {
-                val s = Socket()
+                val s = session
                 socket = s
                 s.connect(InetSocketAddress(peer.address, peer.port), 4000)
                 s.tcpNoDelay = true
@@ -502,8 +503,14 @@ class RemoteClient {
                     }
                 }
             } catch (e: Exception) {
-                if (running.get()) status.value = e.message ?: "连接中断"
-            } finally { close() }
+                if (running.get() && socket === session) {
+                    status.value = e.message ?: "连接中断"
+                }
+            } finally {
+                // A previous reader MUST NOT tear down a newly connected session.
+                if (socket === session) close()
+                else try { session.close() } catch (_: Exception) {}
+            }
         }, "NearCast-client").start()
     }
 
@@ -616,7 +623,7 @@ class RemoteClient {
         if (value != null) createDecoderIfReady()
     }
 
-    private fun requestSync() {
+    @Synchronized private fun requestSync() {
         val now = SystemClock.elapsedRealtime()
         if (now - lastSyncMs < 300) return
         lastSyncMs = now

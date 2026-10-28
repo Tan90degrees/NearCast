@@ -74,3 +74,14 @@ clients; no on-device *true* on-screen frame counting; experimental UDP has no
 congestion control, FEC, encryption, authenticated handshake or full latency
 telemetry. Neither codec requested FPS nor screen Hz should be called "actual
 end-to-end FPS".
+
+
+## 编解码器探测与刷新率切换专项验证
+
+1. 两台手机分别启动 NearCast，读取本机 H.264/H.265/AV1 编码和解码器名称、[HW]/[SW] 标签、Surface 编码能力及 720p120 声明。
+2. 不共享屏幕时点击「实测初始化」，检查 configure/start 的成功/失败标签；确认共享中该操作不可触发。
+3. A 配对 B 后检查 A 显示 B 支持的解码格式，并测试选择不兼容格式是否被禁止。
+4. 在 A 选择 AV1，检查运行中实际编码器名称。必须不会选择 software/Google AV1；如没有硬件 AV1 应优先回退 HEVC（若 B 支持）。
+5. A 选择 H.265 + 120 FPS，先在桌面滚动，再进入已知让屏幕降至 60 Hz 的 App。记录 A 物理/虚拟 Hz、编码 FPS、平均 PTS 间隔及帧间隔变化量；与 B 接收/解码 FPS 对照。
+6. 比较 UDP 重排序更改前后的 IDR 请求增量与明显卡顿次数；网络带宽高并不排除短时乱序/丢包。
+7. 同时验证 H.264、H.265 和 AV1 编码的实际端到端时延；configure/start 成功不是时延测试，尤其 AV1 要进行真机 Glass-to-Glass 测量。

@@ -1,78 +1,59 @@
 # NearCast
 
-Android ↔ Android 局域网屏幕共享与远程控制。单 APK，轻量、无需账号或云服务器。
+Android ↔ Android 局域网屏幕共享与远程触控，单 APK、无账号或云服务。
 
-> **状态：v0.1 实验性原型。仅适合自己控制的设备和可信 Wi-Fi。尚未实现传输加密、跨机型性能验证或发布级稳定性。**
+> **开发预览版 v0.2 / Draft PR #1**：代码通过 Android CI 编译，不代表通过双机真机测试。当前控制信令与媒体是**明文 TCP**（配对码不是加密协议），仅用于本人设备的可信隔离局域网，不能作为公网或生产可用软件发布。
 
-## 已实现（初始原型）
+## 功能
 
-- Kotlin + Jetpack Compose / Material 3 简洁双角色 UI
-- Android NSD / mDNS 自动发现与广播（\`_nearcast._tcp.\`）
-- 设备列表、一键选取、6 位一次会话配对码；手动 IP:端口备选
-- Android MediaProjection → VirtualDisplay → MediaCodec Surface 硬件 H.264 编码
-- TCP 测试视频链路 → MediaCodec 硬件解码 → SurfaceView 直显
-- 无障碍服务远程点击、滑动（抬手后执行）、返回、Home、最近任务
-- 60/90/120 FPS 目标参数（实际刷新率受设备采集/编码能力影响，尚未实测）
-- **省电暗屏**：经用户授权，最小化系统屏幕亮度，保持被控设备显示活动；退出共享时还原亮度设置，并在下次启动时进行异常恢复
-- MediaProjection 前台服务通知和主动停止入口
-- GitHub Actions Debug APK 构建流程
+- Android NSD/mDNS 自动发现设备，手动 IP:端口连接后备
+- 局域网六位验证码配对，同一 APK 兼具被控端和控制端
+- MediaProjection + MediaCodec + SurfaceView 的硬件编解码链路
+- 编码选择：H.264 / H.265 / AV1，优先选中模式，初始化失败自动回退 H.264；接收端必须具备对应解码器
+- 分辨率：720p（长边 1280）、1080p（长边 1920）、原生（最高长边 4096）；实际按硬件能力自动回退
+- 目标帧率：60 / 90 / 120 FPS；真实帧率依赖屏幕更新与 MediaProjection / MediaCodec 硬件实现
+- **全屏观看**：隐藏系统栏，全屏按钮和退出全屏入口；保持原视频比例避免误触坐标偏差
+- **视频稳定性改进**：发送队列与编码器输出解耦；遇到 TCP 阻塞导致队列溢出时丢弃旧 GOP，并请求新 IDR 关键帧；连接端 SurfaceView 在最小化/恢复时重建解码器、重放参数集并向被控端请求关键帧
+- **系统声音（Android 10+）**：可选 AudioPlaybackCapture → PCM 48kHz/16-bit/mono → AudioTrack，使用用户明确授予的录音及屏幕捕获权限；仅能捕获允许共享的 MEDIA/GAME 音频，无法捕获通话、受保护/禁止捕获音频。此版优先可用性，尚未实现 Opus、音视频时钟同步和自适应抖动缓冲
+- AccessibilityService 点击/滑动/返回/Home/最近任务
+- 省电暗屏：最低亮度 + 显示保持唤醒，**不是真正的物理息屏**。部分 Android 系统锁屏将终止 MediaProjection
 
-## 重要边界
+### 安装与构建
 
-1. **不能保证物理关屏远控**。Android 15 QPR1 及以后，锁定手机通常会自动终止 MediaProjection。普通无 Root APK 的“省电暗屏”仅把亮度降至系统最低并阻止自动休眠，**不是真正关闭 OLED/屏幕面板**。部分 OEM 可能限制旧式 wake lock 或亮度写入；需实机验证。未来可考虑单独提供 ADB/Shizuku 授权的高级模式，不能在普通权限中绕过系统。
-2. **必须手动授权**：被控端用户在每次新屏幕共享会话接受系统录屏授权；若需远程触控，用户需在设置中启用 NearCast 无障碍服务。锁定屏幕或主动停止会话时会停播。
-3. **安全限制**：当前协议是明文 TCP + 6 位码，不抗 LAN 监听与中间人攻击；不要在公共 Wi-Fi 或敏感设备上使用。正式发布前必须加入设备身份认证、加密媒体与控制通道、连接频控/用户确认。
-4. **视频链路为 MVP**：TCP 队头阻塞和每帧内存拷贝不适合极限低延迟场景；下一阶段替换为低缓冲加密 UDP/RTP、IDR 恢复及帧统计。
-5. **连续滑动**：当前在手指抬起后提交一条完整滑动手势，不是每帧实时 MOVE；持续拖动、多点触控、输入法、旋转过程中会话自动重配待完善。
-6. 目前只支持同一局域网可直接互访的设备，无公网和中继能力。Android 17 / target 37+ 需要接入新局域网权限 \`ACCESS_LOCAL_NETWORK\` 或系统设备选择流程；此原型 targetSdk 为 35。
-7. 个别应用启用 \`FLAG_SECURE\` 后其画面不可捕获。
+两台 Android 8+ 手机安装**同一版本的 APK**，连到互相可达的 Wi-Fi。
+到 GitHub Actions 成功构建的工作流中下载 \`NearCast-debug\` artifact，解压并安装。
 
-## 使用
-
-1. 两台 Android 8.0+ 手机连到同一 Wi-Fi，禁用 AP/client isolation。
-2. 安装相同版本的 NearCast APK，打开后等待在「附近设备」中自动发现。
-3. 控制端选择被控端，输入被控端显示的 6 位配对码。
-4. 被控端点击「开始共享」，接受系统录屏授权；需要远控时手动打开「设置控制权限」并启用 NearCast。
-5. 控制端在画面上点击/滑动，底部支持返回、主页、最近任务。
-6. 被控端可选打开「省电暗屏」；需额外授予「修改系统设置」权限，允许后回到应用再次开启。使用后点「停止共享」自动还原。
-
-### 构建
-
-Android Studio（JDK 17，Android SDK 35）打开仓库根目录并运行 \`app\`。
-
-或使用 Gradle 8.10.2 / JDK 17 执行：
+本地：Android Studio（JDK 17 / Android SDK 35），或 Gradle 8.10.2：
 
 \`\`\`bash
 gradle :app:assembleDebug
 \`\`\`
 
-CI 会上传 \`NearCast-debug\` APK artifact。
+### 操作
 
-## 模块
+1. 打开两台手机 NearCast，控制端从附近设备列表选中被控端并输入六位配对码。
+2. 被控端开始共享前选择编码、分辨率、FPS、是否共享声音；如果启用声音，先允许系统的录音权限弹窗。
+3. 被控端允许系统屏幕采集，远程触控另外需要手动开启无障碍服务。
+4. 控制端点击「全屏」切换沉浸显示，右上角可退出全屏。
+5. 断开时主动「停止共享」释放媒体资源；音频开关的改变需要开启**新一轮**共享才能生效。
 
-\`\`\`text
-app/
-  MainActivity.kt              Compose 双角色交互
-  NearCastRuntime.kt           当前进程会话管理
-  network/NearbyDiscovery.kt   NSD 自动发现
-  network/LanSession.kt        配对、会话与帧协议
-  network/AvcSurfaceDecoder.kt 硬解码到 Surface
-  capture/CaptureService.kt    录屏授权与前台服务
-  capture/ScreenEncoder.kt     Surface 直通硬编码
-  capture/DimScreen.kt         暗屏亮度控制/恢复
-  input/RemoteInputService.kt  用户授权的无障碍手势
+### 常见问题
+
+- **从后台恢复时画面短暂黑屏**：需要 Android 恢复视频 Surface、解码器等待新 IDR；恢复时间受编码器关键帧生成及网络情况影响。若持续黑屏，复制日志并报告手机型号与 Android 版本。
+- **闪断或跳帧**：视频当前仍使用 TCP，Wi-Fi 拥塞会导致队头阻塞；队列溢出时旧 GOP 会整体丢弃，避免旧帧越积越多。可以改选 720p / H.264 / 60 FPS 交叉验证。丢帧/GOP 同步计数仅表示队列过载事件，不是每帧统计。
+- **声音为空**：仅 Android 10+ 支持内部回放采集，需要授予 RECORD_AUDIO、MediaProjection 许可，且目标应用允许播放捕获。受保护视频、通话和一些游戏/音乐应用不会提供音频。
+- **H.265 / AV1 没画面**：两台手机均需支持相应编码/解码，部分厂商声明支持但实际初始化失败；重新连接后选择 H.264。
+- **旋转**：当前编码分辨率在开始共享时确定，旋转后的动态 VirtualDisplay resize 尚未实现，建议停止共享并重新授权。
+- **协议说明**：可切换的是**视频编码协议**；目前网络层依然是 TCP，尚不支持 UDP/RTP/QUIC 切换。进一步低时延需要独立、加密的 UDP/SRTP FastPath，不能将当前版本宣称为 120 FPS 超低时延稳定实现。
+- **安全提醒**：PIN 只检查会话意图，不能防止 LAN 嗅探或中间人。当前测试版严禁公网部署及处理敏感数据。
+
+### 日志
+
+\`\`\`bash
+adb logcat -v time -s NearCastCapture NearCastEncoder NearCastDecoder NearCastHost NearCastAudioCapture NearCastAudio
 \`\`\`
 
-## 下一步（按优先级）
-
-- [ ] Android Actions/真实设备构建和 Android 8/12/14/15/16 兼容性验证
-- [ ] 加密身份认证和用户明确授权远控会话
-- [ ] 视频 UDP FastPath + 分片/FEC或NACK/请求 IDR + 丢帧重同步
-- [ ] 帧率与端到端延迟监控（Glass-to-Glass / touch-to-display）
-- [ ] 横竖屏动态 resize、编码器/解码器重配置
-- [ ] 连续触控 / 多指手势，控制端键盘输入
-- [ ] 真实关屏的高级授权扩展（仅在平台与授权方式允许时）
-- [ ] Android 17 本地网络授权与发现 API 兼容
+CI / 真机专项测试项见 \`docs/VERIFICATION.md\`。
 
 ## License
 

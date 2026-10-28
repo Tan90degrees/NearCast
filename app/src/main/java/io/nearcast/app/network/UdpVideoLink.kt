@@ -27,7 +27,7 @@ private const val PAYLOAD = 1174
 private const val MAX_FRAGMENT_COUNT = 2048
 
 class UdpVideoSender {
-    private val socket = DatagramSocket(0)
+    private val socket = DatagramSocket(0).apply { sendBufferSize = 512 * 1024 }
     val localPort: Int get() = socket.localPort
     private var destination: InetSocketAddress? = null
     private var nextId = 0
@@ -42,20 +42,26 @@ class UdpVideoSender {
         val count = maxOf(1, (bytes.size + PAYLOAD - 1) / PAYLOAD)
         if (count > MAX_FRAGMENT_COUNT) return
         val frameId = nextId++
+        // Reuse one packet and buffer per access unit, not one allocation per
+        // ~1 KB fragment: at 120 FPS the previous code created thousands of
+        // temporary objects per second, causing GC pauses and bursty sending.
+        val buffer = ByteArray(HEADER + PAYLOAD)
+        val header = ByteBuffer.wrap(buffer).order(ByteOrder.BIG_ENDIAN)
+        val packet = DatagramPacket(buffer, buffer.size, dst)
         for (i in 0 until count) {
             val start = i * PAYLOAD
             val size = minOf(PAYLOAD, bytes.size - start)
-            val datagram = ByteBuffer.allocate(HEADER + size).order(ByteOrder.BIG_ENDIAN)
-            datagram.putInt(MAGIC)
-            datagram.putInt(frameId)
-            datagram.putInt(flags)
-            datagram.putLong(ptsUs)
-            datagram.putShort(i.toShort())
-            datagram.putShort(count.toShort())
-            datagram.putShort(size.toShort())
-            datagram.put(bytes, start, size)
-            val pkt = DatagramPacket(datagram.array(), HEADER + size, dst)
-            socket.send(pkt)
+            header.clear()
+            header.putInt(MAGIC)
+            header.putInt(frameId)
+            header.putInt(flags)
+            header.putLong(ptsUs)
+            header.putShort(i.toShort())
+            header.putShort(count.toShort())
+            header.putShort(size.toShort())
+            System.arraycopy(bytes, start, buffer, HEADER, size)
+            packet.length = HEADER + size
+            socket.send(packet)
         }
     }
 

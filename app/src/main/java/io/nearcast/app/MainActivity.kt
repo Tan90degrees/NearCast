@@ -439,6 +439,10 @@ private fun RemoteViewer(onClose: () -> Unit) {
     val codec by client.codecName.collectAsState()
     val received by client.decodedFrames.collectAsState()
     val fps by client.receivedFps.collectAsState()
+    val outputFps by client.renderedFps.collectAsState()
+    val rxMbps by client.receiveMbps.collectAsState()
+    val decodeDepth by client.decodeQueueDepth.collectAsState()
+    val decodeOverflows by client.videoQueueOverflows.collectAsState()
     val resync by client.recoveryRequests.collectAsState()
     val context = LocalContext.current
     val activity = context as? Activity
@@ -477,7 +481,12 @@ private fun RemoteViewer(onClose: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("远程屏幕 · $codec", fontWeight = FontWeight.Bold)
-                        Text("$status · $fps FPS(提交) · 同步请求 $resync · 总帧 $received",
+                        Text(status + " · 解码提交 " + fps + " FPS / 解码输出 " +
+                            outputFps + " FPS · 总提交 " + received,
+                            style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                        Text("接收 " + "%.1f".format(rxMbps) + " Mbps · 解码排队 " +
+                            decodeDepth + " 帧 · 排队溢出 " + decodeOverflows +
+                            " · IDR 请求 " + resync,
                             style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
                     }
                     TextButton(onClick = { immersive = true }) { Text("全屏") }

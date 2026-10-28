@@ -48,6 +48,12 @@ class HostServer(private val context: Context) {
     val connected = MutableStateFlow(false)
     val status = MutableStateFlow("等待同一 Wi-Fi 下的设备连接")
     val droppedFrames = MutableStateFlow(0L)
+    val encodedFps = MutableStateFlow(0)
+    val encodedMbps = MutableStateFlow(0.0)
+    val physicalDisplayHz = MutableStateFlow(0f)
+    val virtualDisplayHz = MutableStateFlow(0f)
+    val writerQueueDepth = MutableStateFlow(0)
+    val wireMbps = MutableStateFlow(0.0)
     @Volatile var onNeedKeyframe: (() -> Unit)? = null
     @Volatile private var current: HostLink? = null
     private val running = AtomicBoolean(true)
@@ -85,6 +91,9 @@ class HostServer(private val context: Context) {
             val link = HostLink(socket, output, {
                 droppedFrames.value += 1
                 onNeedKeyframe?.invoke()
+            }, { depth, mbps ->
+                writerQueueDepth.value = depth
+                wireMbps.value = mbps
             })
             current = link
             connected.value = true
@@ -157,7 +166,8 @@ class HostServer(private val context: Context) {
 
     private class HostLink(
         val socket: Socket, private val output: DataOutputStream,
-        private val requestSync: () -> Unit
+        private val requestSync: () -> Unit,
+        private val onNetworkStats: (Int, Double) -> Unit
     ) {
         private val open = AtomicBoolean(true)
         private val pending = ArrayBlockingQueue<Packet>(24)
@@ -167,6 +177,8 @@ class HostServer(private val context: Context) {
         private var udpSender: UdpVideoSender? = null
         private var useUdp = false
         private var waitingKeyframe = false
+        private var statsMs = SystemClock.elapsedRealtime()
+        private var windowBytes = 0L
 
         fun startWriter() {
             writer = Thread({
@@ -203,7 +215,18 @@ class HostServer(private val context: Context) {
                                 output.write(item.bytes)
                             }
                         }
-                        // Avoid per-frame flush: DataOutputStream directly writes to socket.
+                        windowBytes += when (item) {
+                            is Packet.Video -> item.bytes.size.toLong()
+                            is Packet.Audio -> item.bytes.size.toLong()
+                            is Packet.Size -> 32L
+                        }
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - statsMs >= 1000L) {
+                            onNetworkStats(pending.size,
+                                windowBytes * 8.0 / (now - statsMs) / 1000.0)
+                            statsMs = now
+                            windowBytes = 0L
+                        }
                     }
                 } catch (e: Exception) {
                     if (open.get()) Log.w("NearCastHost", "Network writer failed", e)

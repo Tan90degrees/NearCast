@@ -135,6 +135,12 @@ private fun NearCastApp(
     val transport by NearCastRuntime.transport.collectAsState()
     val audioActive by NearCastRuntime.audioActive.collectAsState()
     val dropped by server.droppedFrames.collectAsState()
+    val encoderFps by server.encodedFps.collectAsState()
+    val encoderMbps by server.encodedMbps.collectAsState()
+    val wireMbps by server.wireMbps.collectAsState()
+    val writerDepth by server.writerQueueDepth.collectAsState()
+    val sourceHz by server.physicalDisplayHz.collectAsState()
+    val virtualHz by server.virtualDisplayHz.collectAsState()
     val message by NearCastRuntime.message.collectAsState()
     val diagnostic by NearCastRuntime.captureDiagnostic.collectAsState()
     var selectedPeer by remember { mutableStateOf<NearbyPeer?>(null) }
@@ -295,7 +301,14 @@ private fun NearCastApp(
                 "当前音频：" + if (audioActive) "传输中" else "未开启或不可捕获",
                 color = Aqua, style = MaterialTheme.typography.bodySmall
             )
-            Text("GOP 重同步次数：$dropped · 实际媒体模式：" +
+            Text("屏幕 " + sourceHz.toInt() + "Hz / 虚拟屏 " + virtualHz.toInt() +
+                "Hz · 实际编码 " + encoderFps + " FPS / " +
+                "%.1f".format(encoderMbps) + " Mbps",
+                style = MaterialTheme.typography.bodySmall, color = Aqua)
+            Text("网络写出 " + "%.1f".format(wireMbps) + " Mbps · 发送排队 " +
+                writerDepth + " 帧 · GOP 重同步 " + dropped,
+                style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+            Text("实际媒体模式：" +
                 transport.label + "。H.265/AV1 不可用时自动回退 H.264。",
                 style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
         }

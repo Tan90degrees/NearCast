@@ -9,6 +9,7 @@ import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Build
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Surface
@@ -101,6 +102,16 @@ class ScreenEncoder(
         // Never perform Socket writes from CaptureService.onStartCommand (main thread).
         // Sending the dimensions on the SAME worker as the AVC stream also
         // guarantees the SIZE packet arrives before the first VIDEO packet.
+        try {
+            val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            @Suppress("DEPRECATION")
+            val physical = wm.defaultDisplay.refreshRate
+            host.physicalDisplayHz.value = physical
+            host.virtualDisplayHz.value = display.display?.refreshRate ?: 0f
+            Log.i(TAG, "physicalHz=" + physical + " virtualHz=" + host.virtualDisplayHz.value)
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot read display refresh rate", e)
+        }
         Log.i(TAG, "Using " + ready.name + " (" + mime + ") " + width + "x" + height + "@" + fps)
         host.onNeedKeyframe = { requestKeyframe() }
         outputThread = Thread({ drain() }, "NearCast-encoder").also { it.start() }
@@ -206,6 +217,9 @@ class ScreenEncoder(
             return
         }
         val info = MediaCodec.BufferInfo()
+        var statsMs = SystemClock.elapsedRealtime()
+        var frameCount = 0
+        var bytesCount = 0L
         while (running.get()) {
             try {
                 val index = codec.dequeueOutputBuffer(info, 10_000)
@@ -227,8 +241,23 @@ class ScreenEncoder(
                             val data = ByteArray(info.size)
                             buffer.get(data)
                             host.sendFrame(info.flags, info.presentationTimeUs, data)
+                            if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                                frameCount++
+                                bytesCount += info.size.toLong()
+                            }
                         }
                     } finally { codec.releaseOutputBuffer(index, false) }
+                }
+                val now = SystemClock.elapsedRealtime()
+                if (now - statsMs >= 1000L) {
+                    val ms = (now - statsMs).coerceAtLeast(1L)
+                    host.encodedFps.value = (frameCount * 1000L / ms).toInt()
+                    host.encodedMbps.value = bytesCount * 8.0 / ms / 1000.0
+                    Log.d(TAG, "encoder actual fps=" + host.encodedFps.value +
+                        " bitrate=" + host.encodedMbps.value + " Mbps; target=" + fps)
+                    frameCount = 0
+                    bytesCount = 0L
+                    statsMs = now
                 }
             } catch (e: Exception) {
                 if (running.get()) {

@@ -23,6 +23,7 @@ object NearCastRuntime {
     val dimActive = MutableStateFlow(false)
     val requestedFps = MutableStateFlow(60)
     val message = MutableStateFlow<String?>(null)
+    val captureDiagnostic = MutableStateFlow<String?>(null)
 
     @Synchronized fun initialize(context: Context) {
         if (host != null) return

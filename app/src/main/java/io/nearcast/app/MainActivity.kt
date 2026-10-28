@@ -152,6 +152,10 @@ internal fun RemoteViewer(onClose: () -> Unit) {
     val activity = context as? Activity
     val receiverHz = activity?.display?.refreshRate ?: 0f
     var immersive by remember { mutableStateOf(false) }
+    var showQuality by remember { mutableStateOf(false) }
+    var showDiagnostics by remember { mutableStateOf(false) }
+    val bitrate by client.bitrateLimitMbps.collectAsState()
+    var bitrateSlider by remember(bitrate) { mutableFloatStateOf(bitrate.toFloat()) }
 
     DisposableEffect(immersive) {
         val window = activity?.window
@@ -203,16 +207,12 @@ internal fun RemoteViewer(onClose: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("远程屏幕 · $codec", fontWeight = FontWeight.Bold)
-                        Text(status + " · 接收屏 " + receiverHz.toInt() + "Hz · 解码提交 " +
-                            fps + " FPS / 解码输出 " +
-                            outputFps + " FPS · 总提交 " + received,
-                            style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
-                        Text("接收 " + "%.1f".format(rxMbps) + " Mbps · 控制 RTT " +
-                            controlRtt + "ms / 抖动 " + controlJitter + "ms · 解码排队 " +
-                            decodeDepth + " 帧 · 排队溢出 " + decodeOverflows +
-                            " · IDR 请求 " + resync,
+                        Text(outputFps.toString() + " FPS 输出 · " +
+                            "%.1f".format(rxMbps) + " Mbps 接收",
                             style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
                     }
+                    TextButton(onClick = { showQuality = true }) { Text("码率") }
+                    TextButton(onClick = { showDiagnostics = true }) { Text("统计") }
                     TextButton(onClick = { immersive = true }) { Text("全屏") }
                     TextButton(onClick = onClose) { Text("断开") }
                 }
@@ -278,10 +278,59 @@ internal fun RemoteViewer(onClose: () -> Unit) {
             }
         }
         if (immersive) {
-            FilledTonalButton(
-                modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
-                onClick = { immersive = false }
-            ) { Text("退出全屏") }
+            Row(Modifier.align(Alignment.TopEnd).padding(8.dp)) {
+                FilledTonalButton(onClick = { showQuality = true }) { Text("码率") }
+                Spacer(Modifier.width(8.dp))
+                FilledTonalButton(onClick = { immersive = false }) { Text("退出全屏") }
+            }
         }
+    }
+    if (showQuality) {
+        AlertDialog(
+            onDismissRequest = { showQuality = false },
+            title = { Text("视频码率上限") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(bitrateSlider.toInt().toString() + " Mbps",
+                        style = MaterialTheme.typography.headlineMedium, color = Aqua)
+                    Slider(value = bitrateSlider, onValueChange = { bitrateSlider = it },
+                        onValueChangeFinished = {
+                            client.setBitrateLimit(bitrateSlider.toInt())
+                        }, valueRange = 2f..60f, steps = 57)
+                    Text("客户端可实时调整编码器码率目标；实际码率随画面内容变化。" +
+                        "降低码率可缓解突发发送、网络及解码积压。",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    client.setBitrateLimit(bitrateSlider.toInt())
+                    showQuality = false
+                }) { Text("应用") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showQuality = false }) { Text("取消") }
+            }
+        )
+    }
+    if (showDiagnostics) {
+        AlertDialog(
+            onDismissRequest = { showDiagnostics = false },
+            title = { Text("实时传输统计") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("解码提交 " + fps + " FPS / 输出 " + outputFps + " FPS")
+                    Text("接收 " + "%.1f".format(rxMbps) + " Mbps")
+                    Text("RTT " + controlRtt + " ms / 抖动 " + controlJitter + " ms")
+                    Text("解码排队 " + decodeDepth + " / 队列溢出 " + decodeOverflows)
+                    Text("IDR 请求 " + resync + " / 已提交帧 " + received)
+                    Text("接收屏幕 " + receiverHz.toInt() + " Hz")
+                    Text(status, style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showDiagnostics = false }) { Text("关闭") }
+            }
+        )
     }
 }

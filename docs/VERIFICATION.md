@@ -24,3 +24,53 @@
 - Android 17 本地网络权限适配
 
 状态：代码实现，不是已完成测试的声明。
+
+## 120 FPS & "1000 Mbps but stutters" diagnostic matrix
+
+Run a real scrolling/animation workload on the **captured** device. An idle
+screen does not necessarily produce video frames at the display refresh rate.
+Compare the statistics displayed in both apps over 15–30 seconds.
+
+| Host physical / virtual display | Host actual encoded | Client decoder submitted | Client decoded output | Interpretation |
+| --- | --- | --- | --- | --- |
+| 120 / 60 Hz | ~60 FPS | ~60 | ~60 | VirtualDisplay / capture path or OS refresh policy is likely limiting output; setting MediaCodec to 120 is insufficient |
+| 120 / 120 Hz | ~60 FPS | ~60 | ~60 | Encoder input/capture production or codec performance; test device restrictions and MediaProjection output PTS |
+| 120 / 120 Hz | ~120 FPS | ~60 | ~60 | Look at sender backlog, receiver receive Mbps, decode queue overflows and IDR requests |
+| 120 / 120 Hz | ~120 FPS | ~120 | ~60 | Decoder output / render bottleneck; inspect codec support and receiving display mode |
+| 120 / 120 Hz | ~120 FPS | ~120 | ~120 | Pipeline outputs 120, but screen/display refresh and glass-to-glass latency still need measurement |
+
+Important: host "virtual display Hz" is a reported property; it does not
+guarantee captured frames actually arrive at that rate. Client "decoded
+output FPS" counts output buffers released for rendering, NOT verified
+on-screen presentation at each VSYNC.
+
+Throughput of 1000 Mbps measures capacity, not per-packet latency, queue delay
+or UDP burst loss. This preview uses 7–14 Mbps nominal video bitrate, so a
+1 Gbps link should have ample average capacity; inspect burst queue behavior,
+packet loss and decode time before increasing bitrate.
+
+Current fixes:
+- Network reader threads no longer call MediaCodec.enqueue/dequeue directly.
+  Decoder input has a dedicated queue and worker.
+- UDP sender reuses a 1200-byte packet buffer per video access unit instead
+  of creating a buffer+DatagramPacket for every fragment.
+- Shows host physical/virtual refresh rate, *actual* encoded FPS/bitrate,
+  network writer Mbps and depth, client decode input/output FPS and queue,
+  incoming Mbps and IDR requests.
+- Receiver UI requests the highest same-resolution supported display mode.
+  Android/OEM may still override it.
+
+Suggested experiments:
+1. Both devices plugged in, disabled battery saver, system display refresh set
+   to 120 Hz where supported; run a sustained moving animation.
+2. Set H.264, 720p, 120 FPS. Compare TCP and UDP modes separately.
+3. Repeat with system refresh forced to 60 Hz as a negative control.
+4. Record 10-second stats / Logcat and look for encoder FPS (60 cap) versus
+   decoder queue overflows (network/decode throughput cap).
+5. Do not increase bitrate until you can identify the failing pipeline stage.
+
+Known design limitations: no 120-FPS guarantee for public MediaProjection
+clients; no on-device *true* on-screen frame counting; experimental UDP has no
+congestion control, FEC, encryption, authenticated handshake or full latency
+telemetry. Neither codec requested FPS nor screen Hz should be called "actual
+end-to-end FPS".

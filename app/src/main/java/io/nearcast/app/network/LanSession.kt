@@ -12,6 +12,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -115,6 +116,11 @@ class HostServer(private val context: Context) {
     fun sendFrame(flags: Int, ptsUs: Long, data: ByteArray) =
         current?.sendFrame(flags, ptsUs, data) ?: Unit
 
+    /** Close the socket so the receiving thread observes EOF and ends capture. */
+    fun disconnectActivePeer() {
+        current?.close()
+    }
+
     fun close() {
         running.set(false)
         current?.close()
@@ -153,6 +159,11 @@ class RemoteClient {
     @Volatile private var surface: Surface? = null
     @Volatile private var dimensions: Pair<Int, Int>? = null
     private val sendLock = Any()
+    // RemoteViewer invokes input() on the Compose main thread.
+    // All Socket writes belong on this one dedicated I/O executor.
+    private val inputWriter = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "NearCast-input-writer").apply { isDaemon = true }
+    }
 
     fun connect(peer: NearbyPeer, pin: String) {
         close()
@@ -230,19 +241,29 @@ class RemoteClient {
     fun input(action: Int, x1: Float = 0f, y1: Float = 0f,
               x2: Float = 0f, y2: Float = 0f, duration: Int = 0) {
         if (!connected.value) return
-        try {
-            synchronized(sendLock) {
-                val writer = output ?: return
-                writer.writeByte(Wire.INPUT)
-                writer.writeInt(action)
-                writer.writeFloat(x1.coerceIn(0f, 1f))
-                writer.writeFloat(y1.coerceIn(0f, 1f))
-                writer.writeFloat(x2.coerceIn(0f, 1f))
-                writer.writeFloat(y2.coerceIn(0f, 1f))
-                writer.writeInt(duration.coerceIn(0, 10000))
-                writer.flush()
+        // Bind this command to the session that produced it; queued events
+        // must never be delivered to a newly-connected device.
+        val targetSocket = socket ?: return
+        val writer = output ?: return
+        inputWriter.execute {
+            if (!connected.value || socket !== targetSocket || output !== writer) return@execute
+            try {
+                synchronized(sendLock) {
+                    if (socket !== targetSocket || output !== writer) return@synchronized
+                    writer.writeByte(Wire.INPUT)
+                    writer.writeInt(action)
+                    writer.writeFloat(x1.coerceIn(0f, 1f))
+                    writer.writeFloat(y1.coerceIn(0f, 1f))
+                    writer.writeFloat(x2.coerceIn(0f, 1f))
+                    writer.writeFloat(y2.coerceIn(0f, 1f))
+                    writer.writeInt(duration.coerceIn(0, 10000))
+                    writer.flush()
+                }
+            } catch (_: Exception) {
+                // Only tear down the connection that this command belongs to.
+                if (socket === targetSocket) close()
             }
-        } catch (_: Exception) { close() }
+        }
     }
 
     fun close() {

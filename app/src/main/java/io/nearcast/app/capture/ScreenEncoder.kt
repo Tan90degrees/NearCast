@@ -95,13 +95,9 @@ class ScreenEncoder(
             Log.e(TAG, "VirtualDisplay initialization failed", e)
             throw StartupException("创建 VirtualDisplay", e)
         }
-        try {
-            host.sendSize(width, height)
-        } catch (e: Exception) {
-            display.release()
-            releaseReady(ready)
-            throw StartupException("发送视频尺寸", e)
-        }
+        // Never perform Socket writes from CaptureService.onStartCommand (main thread).
+        // Sending the dimensions on the SAME worker as the AVC stream also
+        // guarantees the SIZE packet arrives before the first VIDEO packet.
         Log.i(TAG, "Using " + ready.name + " " + width + "x" + height + "@" + fps)
         outputThread = Thread({ drain() }, "NearCast-encoder").also { it.start() }
     }
@@ -177,6 +173,15 @@ class ScreenEncoder(
     }
 
     private fun drain() {
+        // Socket I/O only on NearCast-encoder, never the Android UI thread.
+        // Do this BEFORE draining the first encoded access unit.
+        try {
+            host.sendSize(width, height)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to send stream dimensions", e)
+            host.disconnectActivePeer()
+            return
+        }
         val info = MediaCodec.BufferInfo()
         while (running.get()) {
             try {
@@ -194,7 +199,10 @@ class ScreenEncoder(
                     } finally { codec.releaseOutputBuffer(index, false) }
                 }
             } catch (e: Exception) {
-                if (running.get()) Log.e(TAG, "Encoder drain failure", e)
+                if (running.get()) {
+                    Log.e(TAG, "Encoder drain/network failure", e)
+                    host.disconnectActivePeer()
+                }
                 break
             }
         }

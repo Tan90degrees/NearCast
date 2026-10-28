@@ -199,7 +199,7 @@ class ScreenEncoder(
         // Stream initialization and encoder drain run outside Android UI thread.
         // Do this BEFORE draining the first encoded access unit.
         try {
-            host.sendSize(width, height, mime)
+            host.sendSize(width, height, mime, options.transport)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send stream dimensions", e)
             host.disconnectActivePeer()

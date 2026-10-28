@@ -6,6 +6,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import io.nearcast.app.capture.CaptureService
+import io.nearcast.app.capture.VideoTransport
 import io.nearcast.app.input.RemoteInputService
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.DataInputStream
@@ -24,12 +25,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Use only on a trusted LAN. No old v1 protocol interop.
  */
 object Wire {
-    const val MAGIC = "NEARCAST/2"
+    const val MAGIC = "NEARCAST/3"
     const val SIZE = 1
     const val VIDEO = 2
     const val INPUT = 3
     const val SYNC = 4
     const val AUDIO = 5
+    const val UDP_PORT = 6
     const val TAP = 1
     const val SWIPE = 2
     const val BACK = 3
@@ -103,6 +105,13 @@ class HostServer(private val context: Context) {
                                 RemoteInputService.dispatch(action, x1, y1, x2, y2, duration)
                         }
                         Wire.SYNC -> if (link === current) onNeedKeyframe?.invoke()
+                        Wire.UDP_PORT -> {
+                            val port = input.readInt()
+                            if (link === current && port in 1..65535) {
+                                link.configureUdpDestination(socket.inetAddress, port)
+                                onNeedKeyframe?.invoke()
+                            }
+                        }
                         else -> throw IllegalArgumentException("Unknown control packet")
                     }
                 }
@@ -122,8 +131,8 @@ class HostServer(private val context: Context) {
         }
     }
 
-    fun sendSize(width: Int, height: Int, mime: String) {
-        current?.sendSize(width, height, mime)
+    fun sendSize(width: Int, height: Int, mime: String, mode: VideoTransport) {
+        current?.sendSize(width, height, mime, mode)
     }
     fun sendFrame(flags: Int, ptsUs: Long, data: ByteArray) {
         current?.sendFrame(flags, ptsUs, data)
@@ -138,7 +147,10 @@ class HostServer(private val context: Context) {
     }
 
     private sealed class Packet {
-        data class Size(val width: Int, val height: Int, val mime: String) : Packet()
+        data class Size(
+            val width: Int, val height: Int, val mime: String,
+            val udp: Boolean, val udpPort: Int
+        ) : Packet()
         data class Video(val flags: Int, val ptsUs: Long, val bytes: ByteArray) : Packet()
         data class Audio(val bytes: ByteArray) : Packet()
     }
@@ -152,6 +164,8 @@ class HostServer(private val context: Context) {
         private var writer: Thread? = null
         private var header: Packet.Size? = null
         private val cachedConfig = ArrayList<Packet.Video>()
+        private var udpSender: UdpVideoSender? = null
+        private var useUdp = false
         private var waitingKeyframe = false
 
         fun startWriter() {
@@ -166,13 +180,19 @@ class HostServer(private val context: Context) {
                                 output.writeInt(item.width)
                                 output.writeInt(item.height)
                                 output.writeUTF(item.mime)
+                                output.writeBoolean(item.udp)
+                                output.writeInt(item.udpPort)
                             }
                             is Packet.Video -> {
-                                output.writeByte(Wire.VIDEO)
-                                output.writeInt(item.flags)
-                                output.writeLong(item.ptsUs)
-                                output.writeInt(item.bytes.size)
-                                output.write(item.bytes)
+                                if (useUdp) {
+                                    udpSender?.send(item.flags, item.ptsUs, item.bytes)
+                                } else {
+                                    output.writeByte(Wire.VIDEO)
+                                    output.writeInt(item.flags)
+                                    output.writeLong(item.ptsUs)
+                                    output.writeInt(item.bytes.size)
+                                    output.write(item.bytes)
+                                }
                             }
                             is Packet.Audio -> {
                                 output.writeByte(Wire.AUDIO)
@@ -188,13 +208,20 @@ class HostServer(private val context: Context) {
             }, "NearCast-video-writer").apply { start() }
         }
 
-        @Synchronized fun sendSize(width: Int, height: Int, mime: String) {
-            val next = Packet.Size(width, height, mime)
+        @Synchronized fun sendSize(width: Int, height: Int, mime: String, mode: VideoTransport) {
+            udpSender?.close()
+            useUdp = mode == VideoTransport.UDP
+            udpSender = if (useUdp) UdpVideoSender() else null
+            val next = Packet.Size(width, height, mime, useUdp, udpSender?.localPort ?: 0)
             header = next
             cachedConfig.clear()
             pending.clear()
             waitingKeyframe = true
             pending.offer(next)
+        }
+
+        @Synchronized fun configureUdpDestination(address: java.net.InetAddress, port: Int) {
+            udpSender?.setDestination(address, port)
         }
 
         @Synchronized fun sendFrame(flags: Int, ptsUs: Long, data: ByteArray) {
@@ -234,6 +261,8 @@ class HostServer(private val context: Context) {
         fun close() {
             if (!open.getAndSet(false)) return
             pending.clear()
+            udpSender?.close()
+            udpSender = null
             try { socket.close() } catch (_: Exception) {}
         }
     }
@@ -255,6 +284,8 @@ class RemoteClient {
     private val codecConfigs = ArrayList<ByteArray>()
     @Volatile private var configApplied = false
     @Volatile private var needKeyframe = true
+    @Volatile private var udpReceiver: UdpVideoReceiver? = null
+    @Volatile private var udpPort = 0
     private val sendLock = Any()
     private var lastSyncMs = 0L
     private val inputWriter = Executors.newSingleThreadExecutor { runnable ->
@@ -288,8 +319,32 @@ class RemoteClient {
                             val w = reader.readInt()
                             val h = reader.readInt()
                             val mime = reader.readUTF()
+                            val udp = reader.readBoolean()
+                            val serverPort = reader.readInt()
                             if (w !in 128..4096 || h !in 128..4096 ||
-                                mime !in listOf("video/avc", "video/hevc", "video/av01")) break
+                                mime !in listOf("video/avc", "video/hevc", "video/av01") ||
+                                (udp && serverPort !in 1..65535)) break
+                            if (udp && (udpReceiver == null || udpPort != serverPort)) {
+                                udpReceiver?.close()
+                                udpPort = serverPort
+                                try {
+                                    val receiver = UdpVideoReceiver(s.inetAddress, serverPort,
+                                        { f, p, data -> receiveVideo(f, p, data) },
+                                        { requestSync() })
+                                    udpReceiver = receiver
+                                    sendCommand(Wire.UDP_PORT) {
+                                        writer.writeInt(receiver.localPort)
+                                    }
+                                } catch (e: Exception) {
+                                    status.value = "UDP 无法启动：" +
+                                        (e.message ?: e.javaClass.simpleName)
+                                    break
+                                }
+                            } else if (!udp) {
+                                udpReceiver?.close()
+                                udpReceiver = null
+                                udpPort = 0
+                            }
                             // Do not reset the decoder when the same SIZE is
                             // resent after a queue overflow.
                             val newSize = Triple(w, h, mime)
@@ -315,42 +370,7 @@ class RemoteClient {
                             if (len !in 0..Wire.MAX_FRAME) break
                             val data = ByteArray(len)
                             reader.readFully(data)
-                            if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                                if (codecConfigs.none { it.contentEquals(data) }) {
-                                    if (codecConfigs.size >= 4) codecConfigs.removeAt(0)
-                                    codecConfigs.add(data.copyOf())
-                                }
-                                val current = decoder
-                                if (current != null && current.queue(flags, pts, data)) {
-                                    configApplied = true
-                                }
-                            } else {
-                                if (needKeyframe) {
-                                    if (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME == 0) continue
-                                    // On resume decoder was recreated, replay codec
-                                    // parameter sets before accepting the IDR.
-                                    val current = decoder
-                                    if (current == null) continue
-                                    if (!configApplied) {
-                                        var applied = true
-                                        codecConfigs.forEach {
-                                            if (!current.queue(MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0, it))
-                                                applied = false
-                                        }
-                                        configApplied = applied
-                                    }
-                                    needKeyframe = false
-                                }
-                                val target = decoder
-                                if (target != null) {
-                                    if (!target.queue(flags, pts, data)) {
-                                        needKeyframe = true
-                                        requestSync()
-                                    } else {
-                                        decodedFrames.value += 1
-                                    }
-                                }
-                            }
+                            receiveVideo(flags, pts, data)
                         }
                         Wire.AUDIO -> {
                             val len = reader.readInt()
@@ -370,6 +390,46 @@ class RemoteClient {
                 if (running.get()) status.value = e.message ?: "连接中断"
             } finally { close() }
         }, "NearCast-client").start()
+    }
+
+    /** Shared handler for TCP and UDP video access units. */
+    private fun receiveVideo(flags: Int, pts: Long, data: ByteArray) {
+                if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                    if (codecConfigs.none { it.contentEquals(data) }) {
+                        if (codecConfigs.size >= 4) codecConfigs.removeAt(0)
+                        codecConfigs.add(data.copyOf())
+                    }
+                    val current = decoder
+                    if (current != null && current.queue(flags, pts, data)) {
+                        configApplied = true
+                    }
+                } else {
+                    if (needKeyframe) {
+                        if (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME == 0) continue
+                        // On resume decoder was recreated, replay codec
+                        // parameter sets before accepting the IDR.
+                        val current = decoder
+                        if (current == null) continue
+                        if (!configApplied) {
+                            var applied = true
+                            codecConfigs.forEach {
+                                if (!current.queue(MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0, it))
+                                    applied = false
+                            }
+                            configApplied = applied
+                        }
+                        needKeyframe = false
+                    }
+                    val target = decoder
+                    if (target != null) {
+                        if (!target.queue(flags, pts, data)) {
+                            needKeyframe = true
+                            requestSync()
+                        } else {
+                            decodedFrames.value += 1
+                        }
+                    }
+                }
     }
 
     @Synchronized
@@ -442,6 +502,9 @@ class RemoteClient {
         try { socket?.close() } catch (_: Exception) {}
         socket = null
         output = null
+        udpReceiver?.close()
+        udpReceiver = null
+        udpPort = 0
         decoder?.close()
         decoder = null
         audio?.close()

@@ -19,9 +19,14 @@ enum class VideoResolution(val label: String, val maxEdge: Int) {
     NATIVE("原生", 4096)
 }
 
+enum class VideoTransport(val label: String) {
+    TCP("TCP 稳定"), UDP("UDP 低延迟")
+}
+
 data class CaptureOptions(
     val codec: VideoCodec = VideoCodec.H264,
     val resolution: VideoResolution = VideoResolution.P720,
     val fps: Int = 60,
-    val audioEnabled: Boolean = false
+    val audioEnabled: Boolean = false,
+    val transport: VideoTransport = VideoTransport.TCP
 )

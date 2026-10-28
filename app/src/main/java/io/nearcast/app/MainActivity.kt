@@ -27,6 +27,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -89,6 +91,7 @@ private fun NearCastApp(
     stopShare: () -> Unit
 ) {
     val ctx = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     val server = NearCastRuntime.host ?: return
     val discoverer = NearCastRuntime.discovery ?: return
     val client = NearCastRuntime.client
@@ -102,6 +105,7 @@ private fun NearCastApp(
     val dimActive by NearCastRuntime.dimActive.collectAsState()
     val fps by NearCastRuntime.requestedFps.collectAsState()
     val message by NearCastRuntime.message.collectAsState()
+    val diagnostic by NearCastRuntime.captureDiagnostic.collectAsState()
     var selectedPeer by remember { mutableStateOf<NearbyPeer?>(null) }
     var pin by remember { mutableStateOf("") }
     var manual by remember { mutableStateOf(false) }
@@ -223,7 +227,14 @@ private fun NearCastApp(
             TextButton(onClick = { manual = true }) { Text("手动连接") }
         }
         if (discoveryError != null) Text(discoveryError ?: "", color = MaterialTheme.colorScheme.error)
-        if (message != null) Text(message ?: "", color = MaterialTheme.colorScheme.error)
+        if (message != null) {
+            Text(message ?: "", color = MaterialTheme.colorScheme.error)
+            if (diagnostic != null) {
+                OutlinedButton(onClick = {
+                    clipboard.setText(AnnotatedString(diagnostic ?: ""))
+                }) { Text("复制故障诊断信息") }
+            }
+        }
         if (clientStatus != "未连接") Text(clientStatus, color = Aqua,
             style = MaterialTheme.typography.bodySmall)
 

@@ -2,6 +2,9 @@ package io.nearcast.app
 
 import android.content.Context
 import io.nearcast.app.capture.DimScreen
+import io.nearcast.app.capture.CaptureOptions
+import io.nearcast.app.capture.VideoResolution
+import io.nearcast.app.capture.VideoCodec
 import io.nearcast.app.network.HostServer
 import io.nearcast.app.network.NearbyDiscovery
 import io.nearcast.app.network.RemoteClient
@@ -22,6 +25,11 @@ object NearCastRuntime {
     val captureActive = MutableStateFlow(false)
     val dimActive = MutableStateFlow(false)
     val requestedFps = MutableStateFlow(60)
+    val resolution = MutableStateFlow(VideoResolution.P720)
+    val codec = MutableStateFlow(VideoCodec.H264)
+    val audioEnabled = MutableStateFlow(false)
+    val audioActive = MutableStateFlow(false)
+    fun options() = CaptureOptions(codec.value, resolution.value, requestedFps.value, audioEnabled.value)
     val message = MutableStateFlow<String?>(null)
     val captureDiagnostic = MutableStateFlow<String?>(null)
 

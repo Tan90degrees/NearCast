@@ -35,6 +35,7 @@ class CaptureService : Service() {
 
     private var projection: MediaProjection? = null
     private var encoder: ScreenEncoder? = null
+    private var audioCapture: PlaybackAudioCapture? = null
     private val callback = object : MediaProjection.Callback() {
         override fun onStop() { stopSelf() }
     }
@@ -90,12 +91,23 @@ class CaptureService : Service() {
                 ?: throw IllegalStateException("getMediaProjection 返回 null")
             stage = "注册 MediaProjection 回调"
             projection?.registerCallback(callback, Handler(Looper.getMainLooper()))
-            stage = "创建 H.264 编码器和 VirtualDisplay"
-            encoder = ScreenEncoder(
-                this, projection ?: error("MediaProjection missing"), host,
-                NearCastRuntime.requestedFps.value
-            )
+            stage = "创建视频编码器和 VirtualDisplay"
+            val opts = NearCastRuntime.options()
+            encoder = ScreenEncoder(this, projection ?: error("MediaProjection missing"), host, opts)
             NearCastRuntime.captureActive.value = true
+            NearCastRuntime.audioActive.value = false
+            if (opts.audioEnabled && Build.VERSION.SDK_INT >= 29) {
+                // Audio failure must not stop an otherwise healthy video session.
+                try {
+                    audioCapture = PlaybackAudioCapture(this, projection!!, host).also { it.start() }
+                    NearCastRuntime.audioActive.value = true
+                } catch (audioError: Exception) {
+                    Log.w(TAG, "System playback capture unavailable", audioError)
+                    NearCastRuntime.message.value = "视频共享正常；音频不可用：" +
+                        audioError.javaClass.simpleName + ": " +
+                        (audioError.message ?: "请检查音频权限与目标应用捕获策略")
+                }
+            }
             Log.i(TAG, "MediaProjection started successfully")
         } catch (e: Exception) {
             // Some Android vendor codecs throw IllegalStateException with NULL message.
@@ -129,6 +141,9 @@ class CaptureService : Service() {
         NearCastRuntime.dimScreen?.restore()
         NearCastRuntime.dimActive.value = false
         NearCastRuntime.captureActive.value = false
+        NearCastRuntime.audioActive.value = false
+        audioCapture?.stop()
+        audioCapture = null
         encoder?.stop()
         encoder = null
         try { projection?.unregisterCallback(callback) } catch (_: Exception) {}

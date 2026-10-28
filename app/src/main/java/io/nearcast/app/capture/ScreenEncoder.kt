@@ -26,11 +26,11 @@ class ScreenEncoder(
     context: Context,
     private val projection: MediaProjection,
     private val host: HostServer,
-    requestedFps: Int
+    private val options: CaptureOptions
 ) {
     companion object {
         private const val TAG = "NearCastEncoder"
-        private const val MIME = MediaFormat.MIMETYPE_VIDEO_AVC
+        private const val FALLBACK_MIME = MediaFormat.MIMETYPE_VIDEO_AVC
     }
 
     class StartupException(stage: String, cause: Throwable) :
@@ -43,7 +43,8 @@ class ScreenEncoder(
         val name: String,
         val width: Int,
         val height: Int,
-        val fps: Int
+        val fps: Int,
+        val mime: String
     )
 
     private val running = AtomicBoolean(true)
@@ -54,6 +55,7 @@ class ScreenEncoder(
     val fps: Int
     val width: Int
     val height: Int
+    val mime: String
 
     init {
         val screen = try {
@@ -75,16 +77,17 @@ class ScreenEncoder(
 
         // Android 14+: MediaProjection can create only one VirtualDisplay per token.
         val ready = try {
-            prepareEncoder(screen.first, screen.second, requestedFps)
+            prepareEncoder(screen.first, screen.second, options)
         } catch (e: Exception) {
             Log.e(TAG, "Encoder initialization failed", e)
-            throw StartupException("初始化 H.264 编码器", e)
+            throw StartupException("初始化视频编码器", e)
         }
         codec = ready.codec
         inputSurface = ready.surface
         width = ready.width
         height = ready.height
         fps = ready.fps
+        mime = ready.mime
         try {
             display = projection.createVirtualDisplay(
                 "NearCast Screen", width, height, context.resources.displayMetrics.densityDpi,
@@ -98,29 +101,37 @@ class ScreenEncoder(
         // Never perform Socket writes from CaptureService.onStartCommand (main thread).
         // Sending the dimensions on the SAME worker as the AVC stream also
         // guarantees the SIZE packet arrives before the first VIDEO packet.
-        Log.i(TAG, "Using " + ready.name + " " + width + "x" + height + "@" + fps)
+        Log.i(TAG, "Using " + ready.name + " (" + mime + ") " + width + "x" + height + "@" + fps)
+        host.onNeedKeyframe = { requestKeyframe() }
         outputThread = Thread({ drain() }, "NearCast-encoder").also { it.start() }
     }
 
-    private fun prepareEncoder(screenW: Int, screenH: Int, requestedFps: Int): Prepared {
-        val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter {
-            it.isEncoder && it.supportedTypes.any { type -> type.equals(MIME, true) }
-        }.sortedByDescending {
-            if (Build.VERSION.SDK_INT >= 29 && it.isHardwareAccelerated) 1 else 0
+    private fun prepareEncoder(screenW: Int, screenH: Int, options: CaptureOptions): Prepared {
+        // Try selected codec first; H.264 is the compatibility fallback.
+        val mimeList = listOf(options.codec.mime, FALLBACK_MIME).distinct()
+        val rates = listOf(options.fps.coerceIn(30, 120), 90, 60, 30)
+            .filter { it <= options.fps.coerceIn(30, 120) }.distinct().sortedDescending()
+        val edges = when (options.resolution) {
+            VideoResolution.NATIVE -> listOf(4096, 2560, 1920, 1280, 960, 720)
+            VideoResolution.P1080 -> listOf(1920, 1600, 1280, 960, 720)
+            VideoResolution.P720 -> listOf(1280, 960, 720)
         }
-        if (codecs.isEmpty()) throw IllegalStateException("没有 H.264 编码器")
-        val rates = listOf(requestedFps.coerceIn(30, 120), 90, 60, 30)
-            .filter { it <= requestedFps.coerceIn(30, 120) }.distinct().sortedDescending()
         var lastFailure: Exception? = null
         var hasSurface = false
-        // Prioritize requested FPS over picture resolution for interactive control.
-        for (rate in rates) {
-            for (maxEdge in listOf(1600, 1280, 960, 720)) {
-                val scale = minOf(1.0, maxEdge.toDouble() / maxOf(screenW, screenH))
-                val idealW = (screenW * scale).roundToInt()
-                val idealH = (screenH * scale).roundToInt()
-                for (info in codecs) {
-                    val caps = try { info.getCapabilitiesForType(MIME) }
+        for (mime in mimeList) {
+            val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter {
+                it.isEncoder && it.supportedTypes.any { type -> type.equals(mime, true) }
+            }.sortedByDescending {
+                if (Build.VERSION.SDK_INT >= 29 && it.isHardwareAccelerated) 1 else 0
+            }
+            // Prioritize desired FPS, then scale down resolution.
+            for (rate in rates) {
+                for (maxEdge in edges) {
+                    val scale = minOf(1.0, maxEdge.toDouble() / maxOf(screenW, screenH))
+                    val idealW = (screenW * scale).roundToInt()
+                    val idealH = (screenH * scale).roundToInt()
+                    for (info in codecs) {
+                    val caps = try { info.getCapabilitiesForType(mime) }
                     catch (e: Exception) { lastFailure = e; continue }
                     if (MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface !in caps.colorFormats) {
                         Log.w(TAG, info.name + " does not support Surface input")
@@ -133,7 +144,7 @@ class ScreenEncoder(
                     if (w < 128 || h < 128 ||
                         !video.areSizeAndRateSupported(w, h, rate.toDouble())) continue
 
-                    val format = MediaFormat.createVideoFormat(MIME, w, h).apply {
+                    val format = MediaFormat.createVideoFormat(mime, w, h).apply {
                         setInteger(MediaFormat.KEY_COLOR_FORMAT,
                             MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                         setInteger(MediaFormat.KEY_BIT_RATE,
@@ -149,19 +160,20 @@ class ScreenEncoder(
                         surface = candidate.createInputSurface()
                         candidate.start()
                         Log.i(TAG, "Selected " + info.name + " " + w + "x" + h + "@" + rate)
-                        return Prepared(candidate, surface, info.name, w, h, rate)
+                        return Prepared(candidate, surface, info.name, w, h, rate, mime)
                     } catch (e: Exception) {
                         Log.w(TAG, "Rejected " + info.name + " " + w + "x" + h + "@" + rate, e)
                         lastFailure = e
                         try { surface?.release() } catch (_: Exception) {}
                         try { candidate?.release() } catch (_: Exception) {}
                     }
+                    }
                 }
             }
         }
         throw IllegalStateException(
-            if (!hasSurface) "系统编码器均不支持 Surface 输入"
-            else "所有分辨率/FPS 的 H.264 Surface 编码初始化均失败",
+            if (!hasSurface) "所选设备编码器均不支持 Surface 输入"
+            else "选定视频编码及 H.264 后备配置全部初始化失败",
             lastFailure
         )
     }
@@ -172,11 +184,22 @@ class ScreenEncoder(
         try { ready.surface.release() } catch (_: Exception) {}
     }
 
+    fun requestKeyframe() {
+        try {
+            val params = android.os.Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            }
+            codec.setParameters(params)
+        } catch (e: Exception) {
+            Log.w(TAG, "Request IDR failed", e)
+        }
+    }
+
     private fun drain() {
-        // Socket I/O only on NearCast-encoder, never the Android UI thread.
+        // Stream initialization and encoder drain run outside Android UI thread.
         // Do this BEFORE draining the first encoded access unit.
         try {
-            host.sendSize(width, height)
+            host.sendSize(width, height, mime)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send stream dimensions", e)
             host.disconnectActivePeer()
@@ -186,7 +209,16 @@ class ScreenEncoder(
         while (running.get()) {
             try {
                 val index = codec.dequeueOutputBuffer(info, 10_000)
-                if (index >= 0) {
+                if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    // Some encoders expose parameter sets only in their output format.
+                    val format = codec.outputFormat
+                    for (i in 0..2) {
+                        val csd = format.getByteBuffer("csd-$i") ?: continue
+                        val copy = ByteArray(csd.remaining())
+                        csd.get(copy)
+                        if (copy.isNotEmpty()) host.sendFrame(MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0, copy)
+                    }
+                } else if (index >= 0) {
                     try {
                         val buffer = codec.getOutputBuffer(index)
                         if (buffer != null && info.size > 0) {
@@ -210,6 +242,7 @@ class ScreenEncoder(
 
     fun stop() {
         if (!running.getAndSet(false)) return
+        host.onNeedKeyframe = null
         try { display.release() } catch (_: Exception) {}
         try { outputThread.join(300) } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()

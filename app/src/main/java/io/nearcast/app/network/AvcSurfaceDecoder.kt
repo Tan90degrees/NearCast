@@ -9,7 +9,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /** Video decoder with explicitly owned input/output lifecycle and MIME negotiation. */
 class AvcSurfaceDecoder(surface: Surface, width: Int, height: Int,
-                        mime: String = MediaFormat.MIMETYPE_VIDEO_AVC) {
+                        mime: String = MediaFormat.MIMETYPE_VIDEO_AVC,
+                        private val onDecodedOutput: () -> Unit = {}) {
     private val codec = MediaCodec.createDecoderByType(mime)
     private val running = AtomicBoolean(true)
     private val outputThread: Thread
@@ -32,7 +33,10 @@ class AvcSurfaceDecoder(surface: Surface, width: Int, height: Int,
             while (running.get()) {
                 try {
                     val index = codec.dequeueOutputBuffer(info, 5000)
-                    if (index >= 0) codec.releaseOutputBuffer(index, true)
+                    if (index >= 0) {
+                        codec.releaseOutputBuffer(index, true)
+                        if (info.size > 0) onDecodedOutput()
+                    }
                 } catch (e: Exception) {
                     if (running.get()) Log.w("NearCastDecoder", "Decode output failed", e)
                     break
@@ -44,7 +48,7 @@ class AvcSurfaceDecoder(surface: Surface, width: Int, height: Int,
     @Synchronized fun queue(flags: Int, ptsUs: Long, data: ByteArray): Boolean {
         if (!running.get()) return false
         return try {
-            val index = codec.dequeueInputBuffer(5000)
+            val index = codec.dequeueInputBuffer(500)
             if (index < 0) return false
             val buffer = codec.getInputBuffer(index)
             if (buffer == null || data.size > buffer.capacity()) {

@@ -417,6 +417,8 @@ private fun RemoteViewer(onClose: () -> Unit) {
     DisposableEffect(immersive) {
         val window = activity?.window
         if (window != null) {
+            // Hide bars AND allow the SurfaceView to occupy their former space.
+            WindowCompat.setDecorFitsSystemWindows(window, !immersive)
             val controller = WindowCompat.getInsetsController(window, window.decorView)
             if (immersive) {
                 controller.systemBarsBehavior =
@@ -428,6 +430,7 @@ private fun RemoteViewer(onClose: () -> Unit) {
         }
         onDispose {
             window?.let {
+                WindowCompat.setDecorFitsSystemWindows(it, true)
                 WindowCompat.getInsetsController(it, it.decorView)
                     .show(WindowInsetsCompat.Type.systemBars())
             }

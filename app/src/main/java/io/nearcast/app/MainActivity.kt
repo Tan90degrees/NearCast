@@ -444,6 +444,8 @@ private fun RemoteViewer(onClose: () -> Unit) {
     val decodeDepth by client.decodeQueueDepth.collectAsState()
     val decodeOverflows by client.videoQueueOverflows.collectAsState()
     val resync by client.recoveryRequests.collectAsState()
+    val controlRtt by client.controlRttMs.collectAsState()
+    val controlJitter by client.controlJitterMs.collectAsState()
     val context = LocalContext.current
     val activity = context as? Activity
     val receiverHz = activity?.display?.refreshRate ?: 0f
@@ -503,7 +505,8 @@ private fun RemoteViewer(onClose: () -> Unit) {
                             fps + " FPS / 解码输出 " +
                             outputFps + " FPS · 总提交 " + received,
                             style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
-                        Text("接收 " + "%.1f".format(rxMbps) + " Mbps · 解码排队 " +
+                        Text("接收 " + "%.1f".format(rxMbps) + " Mbps · 控制 RTT " +
+                            controlRtt + "ms / 抖动 " + controlJitter + "ms · 解码排队 " +
                             decodeDepth + " 帧 · 排队溢出 " + decodeOverflows +
                             " · IDR 请求 " + resync,
                             style = MaterialTheme.typography.bodySmall, color = Color.LightGray)

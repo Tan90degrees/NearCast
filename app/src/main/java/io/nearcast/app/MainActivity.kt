@@ -1,6 +1,9 @@
 package io.nearcast.app
 
 import android.app.Activity
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -14,6 +17,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
@@ -36,7 +41,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import io.nearcast.app.capture.CaptureService
+import io.nearcast.app.capture.VideoCodec
+import io.nearcast.app.capture.VideoResolution
 import io.nearcast.app.network.NearbyPeer
 import io.nearcast.app.network.Wire
 import kotlin.math.hypot
@@ -58,6 +68,14 @@ class MainActivity : ComponentActivity() {
                     ContextCompat.startForegroundService(this, service)
                 } else NearCastRuntime.message.value = "未授权屏幕共享"
             }
+            val audioPermissionLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                if (granted) {
+                    val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    launcher.launch(manager.createScreenCaptureIntent())
+                } else NearCastRuntime.message.value = "未授予系统声音采集权限，关闭音频开关后仍可共享视频"
+            }
             MaterialTheme(colorScheme = darkColorScheme(
                 primary = Aqua, background = Dark, surface = Panel,
                 onSurface = Color(0xFFF0F8F7), onBackground = Color(0xFFF0F8F7)
@@ -65,8 +83,14 @@ class MainActivity : ComponentActivity() {
                 NearCastApp(
                     requestShare = {
                         if (NearCastRuntime.host?.connected?.value == true) {
-                            val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                            launcher.launch(manager.createScreenCaptureIntent())
+                            if (NearCastRuntime.audioEnabled.value && Build.VERSION.SDK_INT >= 29 &&
+                                ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                                    != PackageManager.PERMISSION_GRANTED) {
+                                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            } else {
+                                val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                                launcher.launch(manager.createScreenCaptureIntent())
+                            }
                         }
                     },
                     openAccessibility = {
@@ -104,6 +128,11 @@ private fun NearCastApp(
     val captureActive by NearCastRuntime.captureActive.collectAsState()
     val dimActive by NearCastRuntime.dimActive.collectAsState()
     val fps by NearCastRuntime.requestedFps.collectAsState()
+    val resolution by NearCastRuntime.resolution.collectAsState()
+    val codec by NearCastRuntime.codec.collectAsState()
+    val audioEnabled by NearCastRuntime.audioEnabled.collectAsState()
+    val audioActive by NearCastRuntime.audioActive.collectAsState()
+    val dropped by server.droppedFrames.collectAsState()
     val message by NearCastRuntime.message.collectAsState()
     val diagnostic by NearCastRuntime.captureDiagnostic.collectAsState()
     var selectedPeer by remember { mutableStateOf<NearbyPeer?>(null) }
@@ -119,7 +148,8 @@ private fun NearCastApp(
 
     Column(
         modifier = Modifier.fillMaxSize().background(Dark)
-            .statusBarsPadding().navigationBarsPadding().padding(horizontal = 22.dp),
+            .statusBarsPadding().navigationBarsPadding()
+            .verticalScroll(rememberScrollState()).padding(horizontal = 22.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         Spacer(Modifier.height(12.dp))
@@ -202,6 +232,27 @@ private fun NearCastApp(
         }
 
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("视频设置 · 共享前可调整", style = MaterialTheme.typography.titleMedium)
+            Text("编码协议", style = MaterialTheme.typography.labelLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                VideoCodec.entries.forEach { value ->
+                    FilterChip(
+                        selected = codec == value, enabled = !captureActive,
+                        onClick = { NearCastRuntime.codec.value = value },
+                        label = { Text(value.label) }
+                    )
+                }
+            }
+            Text("传输分辨率", style = MaterialTheme.typography.labelLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                VideoResolution.entries.forEach { value ->
+                    FilterChip(
+                        selected = resolution == value, enabled = !captureActive,
+                        onClick = { NearCastRuntime.resolution.value = value },
+                        label = { Text(value.label) }
+                    )
+                }
+            }
             Text("目标刷新率", style = MaterialTheme.typography.labelLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(60, 90, 120).forEach { value ->
@@ -213,7 +264,24 @@ private fun NearCastApp(
                     )
                 }
             }
-            Text("实际帧率取决于系统采集与硬件编码能力；暂不保证 120 FPS。",
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("共享系统声音", style = MaterialTheme.typography.labelLarge)
+                    Text("仅 Android 10+，支持允许采集的媒体/游戏音频",
+                        style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                }
+                Switch(
+                    checked = audioEnabled,
+                    enabled = !captureActive && Build.VERSION.SDK_INT >= 29,
+                    onCheckedChange = { NearCastRuntime.audioEnabled.value = it }
+                )
+            }
+            if (captureActive) Text(
+                "当前音频：" + if (audioActive) "传输中" else "未开启或不可捕获",
+                color = Aqua, style = MaterialTheme.typography.bodySmall
+            )
+            Text("丢帧/GOP 重同步次数：$dropped · 当前为 TCP 测试传输，" +
+                "H.265/AV1 不可用时自动回退 H.264。",
                 style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
         }
 
@@ -239,7 +307,7 @@ private fun NearCastApp(
             style = MaterialTheme.typography.bodySmall)
 
         if (peers.isEmpty()) {
-            Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+            Box(Modifier.fillMaxWidth().height(152.dp), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("⌁", style = MaterialTheme.typography.displayLarge, color = Aqua)
@@ -249,8 +317,8 @@ private fun NearCastApp(
                 }
             }
         } else {
-            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(peers, key = { it.key }) { peer ->
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                peers.forEach { peer ->
                     Card(onClick = { selectedPeer = peer; pin = "" },
                         colors = CardDefaults.cardColors(containerColor = Panel),
                         shape = RoundedCornerShape(16.dp),
@@ -340,68 +408,114 @@ private fun RemoteViewer(onClose: () -> Unit) {
     val client = NearCastRuntime.client
     val size by client.videoSize.collectAsState()
     val status by client.status.collectAsState()
-    Column(Modifier.fillMaxSize().background(Dark).statusBarsPadding().navigationBarsPadding()) {
-        Row(Modifier.fillMaxWidth().padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("远程屏幕", fontWeight = FontWeight.Bold)
-                Text(status, style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
-            }
-            TextButton(onClick = onClose) { Text("断开") }
-        }
-        BoxWithConstraints(Modifier.fillMaxWidth().weight(1f),
-            contentAlignment = Alignment.Center) {
-            val ratio = size.first.toFloat() / size.second.coerceAtLeast(1)
-            val available = constraints.maxWidth.toFloat() / constraints.maxHeight.coerceAtLeast(1)
-            val modifier = if (ratio >= available) Modifier.fillMaxWidth().aspectRatio(ratio)
-                           else Modifier.fillMaxHeight().aspectRatio(ratio)
-            Box(modifier.background(Color.Black)) {
-                AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { context ->
-                        SurfaceView(context).apply {
-                            holder.addCallback(object : SurfaceHolder.Callback {
-                                override fun surfaceCreated(holder: SurfaceHolder) {
-                                    client.attachSurface(holder.surface)
-                                }
-                                override fun surfaceChanged(holder: SurfaceHolder, format: Int,
-                                                            width: Int, height: Int) = Unit
-                                override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                    client.attachSurface(null)
-                                }
-                            })
-                        }
-                    }
-                )
-                Box(Modifier.matchParentSize().pointerInput(client) {
-                    awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false)
-                        var end = down.position
-                        val started = down.uptimeMillis
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                            end = change.position
-                            if (!change.pressed) break
-                        }
-                        val duration = (android.os.SystemClock.uptimeMillis() - started).toInt()
-                        fun nx(x: Float) = (x / this.size.width.coerceAtLeast(1)).coerceIn(0f, 1f)
-                        fun ny(y: Float) = (y / this.size.height.coerceAtLeast(1)).coerceIn(0f, 1f)
-                        if (hypot(end.x - down.position.x, end.y - down.position.y) < 16f) {
-                            client.input(Wire.TAP, nx(end.x), ny(end.y))
-                        } else {
-                            client.input(Wire.SWIPE, nx(down.position.x), ny(down.position.y),
-                                nx(end.x), ny(end.y), duration)
-                        }
-                    }
-                })
+    val codec by client.codecName.collectAsState()
+    val received by client.decodedFrames.collectAsState()
+    val context = LocalContext.current
+    val activity = context as? Activity
+    var immersive by remember { mutableStateOf(false) }
+
+    DisposableEffect(immersive) {
+        val window = activity?.window
+        if (window != null) {
+            val controller = WindowCompat.getInsetsController(window, window.decorView)
+            if (immersive) {
+                controller.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(WindowInsetsCompat.Type.systemBars())
+            } else {
+                controller.show(WindowInsetsCompat.Type.systemBars())
             }
         }
-        Row(Modifier.fillMaxWidth().padding(12.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly) {
-            OutlinedButton(onClick = { client.input(Wire.BACK) }) { Text("返回") }
-            OutlinedButton(onClick = { client.input(Wire.HOME) }) { Text("主页") }
-            OutlinedButton(onClick = { client.input(Wire.RECENTS) }) { Text("最近任务") }
+        onDispose {
+            window?.let {
+                WindowCompat.getInsetsController(it, it.decorView)
+                    .show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
+    Box(
+        Modifier.fillMaxSize().background(Dark)
+            .then(if (immersive) Modifier else Modifier.statusBarsPadding().navigationBarsPadding())
+    ) {
+        Column(Modifier.fillMaxSize()) {
+            if (!immersive) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("远程屏幕 · $codec", fontWeight = FontWeight.Bold)
+                        Text("$status · 已提交 $received 帧",
+                            style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                    }
+                    TextButton(onClick = { immersive = true }) { Text("全屏") }
+                    TextButton(onClick = onClose) { Text("断开") }
+                }
+            }
+            BoxWithConstraints(
+                Modifier.fillMaxWidth().weight(1f),
+                contentAlignment = Alignment.Center
+            ) {
+                val ratio = size.first.toFloat() / size.second.coerceAtLeast(1)
+                val available = constraints.maxWidth.toFloat() / constraints.maxHeight.coerceAtLeast(1)
+                val videoModifier =
+                    if (ratio >= available) Modifier.fillMaxWidth().aspectRatio(ratio)
+                    else Modifier.fillMaxHeight().aspectRatio(ratio)
+                Box(videoModifier.background(Color.Black)) {
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { c ->
+                            SurfaceView(c).apply {
+                                holder.addCallback(object : SurfaceHolder.Callback {
+                                    override fun surfaceCreated(holder: SurfaceHolder) {
+                                        client.attachSurface(holder.surface)
+                                    }
+                                    override fun surfaceChanged(holder: SurfaceHolder, format: Int,
+                                                                width: Int, height: Int) = Unit
+                                    override fun surfaceDestroyed(holder: SurfaceHolder) {
+                                        client.attachSurface(null)
+                                    }
+                                })
+                            }
+                        }
+                    )
+                    Box(Modifier.matchParentSize().pointerInput(client) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            var end = down.position
+                            val started = down.uptimeMillis
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                end = change.position
+                                if (!change.pressed) break
+                            }
+                            val duration = (android.os.SystemClock.uptimeMillis() - started).toInt()
+                            fun nx(x: Float) = (x / this.size.width.coerceAtLeast(1)).coerceIn(0f, 1f)
+                            fun ny(y: Float) = (y / this.size.height.coerceAtLeast(1)).coerceIn(0f, 1f)
+                            if (hypot(end.x - down.position.x, end.y - down.position.y) < 16f) {
+                                client.input(Wire.TAP, nx(end.x), ny(end.y))
+                            } else {
+                                client.input(Wire.SWIPE, nx(down.position.x), ny(down.position.y),
+                                    nx(end.x), ny(end.y), duration)
+                            }
+                        }
+                    })
+                }
+            }
+            if (!immersive) {
+                Row(Modifier.fillMaxWidth().padding(12.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly) {
+                    OutlinedButton(onClick = { client.input(Wire.BACK) }) { Text("返回") }
+                    OutlinedButton(onClick = { client.input(Wire.HOME) }) { Text("主页") }
+                    OutlinedButton(onClick = { client.input(Wire.RECENTS) }) { Text("最近任务") }
+                }
+            }
+        }
+        if (immersive) {
+            FilledTonalButton(
+                modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
+                onClick = { immersive = false }
+            ) { Text("退出全屏") }
         }
     }
 }

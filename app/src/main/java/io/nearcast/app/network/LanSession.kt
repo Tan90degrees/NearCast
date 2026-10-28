@@ -7,6 +7,8 @@ import android.util.Log
 import android.view.Surface
 import io.nearcast.app.capture.CaptureService
 import io.nearcast.app.capture.VideoTransport
+import io.nearcast.app.capture.CodecProbe
+import io.nearcast.app.capture.VideoCodec
 import io.nearcast.app.input.RemoteInputService
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.DataInputStream
@@ -27,7 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Use only on a trusted LAN. No old v1 protocol interop.
  */
 object Wire {
-    const val MAGIC = "NEARCAST/3"
+    const val MAGIC = "NEARCAST/4"
     const val SIZE = 1
     const val VIDEO = 2
     const val INPUT = 3
@@ -52,6 +54,7 @@ class HostServer(private val context: Context) {
     val connected = MutableStateFlow(false)
     val status = MutableStateFlow("等待同一 Wi-Fi 下的设备连接")
     val droppedFrames = MutableStateFlow(0L)
+    val peerDecoderMask = MutableStateFlow(0)
     val encodedFps = MutableStateFlow(0)
     val encodedMbps = MutableStateFlow(0.0)
     val physicalDisplayHz = MutableStateFlow(0f)
@@ -82,9 +85,12 @@ class HostServer(private val context: Context) {
             socket.soTimeout = 5000
             val input = DataInputStream(socket.getInputStream())
             val output = DataOutputStream(socket.getOutputStream())
-            val accepted = input.readUTF() == Wire.MAGIC &&
-                MessageDigest.isEqual(input.readUTF().toByteArray(), pin.toByteArray()) &&
-                current == null
+            val matchesVersion = input.readUTF() == Wire.MAGIC
+            val matchesPin = MessageDigest.isEqual(
+                input.readUTF().toByteArray(), pin.toByteArray()
+            )
+            val advertisedDecoderMask = input.readInt() and 0x7
+            val accepted = matchesVersion && matchesPin && current == null
             output.writeBoolean(accepted)
             output.flush()
             if (!accepted) {
@@ -100,6 +106,7 @@ class HostServer(private val context: Context) {
                 wireMbps.value = mbps
             })
             current = link
+            peerDecoderMask.value = advertisedDecoderMask
             connected.value = true
             status.value = "已配对 · 请点击共享屏幕"
             socket.soTimeout = 0
@@ -135,6 +142,7 @@ class HostServer(private val context: Context) {
             } finally {
                 if (current === link) {
                     current = null
+                    peerDecoderMask.value = 0
                     onNeedKeyframe = null
                     connected.value = false
                     status.value = "控制端已断开"
@@ -400,6 +408,7 @@ class RemoteClient {
                 val reader = DataInputStream(s.getInputStream())
                 writer.writeUTF(Wire.MAGIC)
                 writer.writeUTF(pin)
+                writer.writeInt(CodecProbe.decoderMask(CodecProbe.scan()))
                 writer.flush()
                 if (!reader.readBoolean()) throw IllegalStateException("配对码错误或版本不兼容")
                 s.soTimeout = 0

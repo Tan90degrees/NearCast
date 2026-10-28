@@ -18,6 +18,7 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -170,7 +171,7 @@ class HostServer(private val context: Context) {
         private val onNetworkStats: (Int, Double) -> Unit
     ) {
         private val open = AtomicBoolean(true)
-        private val pending = ArrayBlockingQueue<Packet>(24)
+        private val pending = ArrayBlockingQueue<Packet>(12)
         private var writer: Thread? = null
         private var header: Packet.Size? = null
         private val cachedConfig = ArrayList<Packet.Video>()
@@ -306,10 +307,43 @@ class RemoteClient {
     val codecName = MutableStateFlow("H.264")
     val decodedFrames = MutableStateFlow(0L)
     val receivedFps = MutableStateFlow(0)
+    val renderedFps = MutableStateFlow(0)
+    val receiveMbps = MutableStateFlow(0.0)
+    val decodeQueueDepth = MutableStateFlow(0)
+    val videoQueueOverflows = MutableStateFlow(0L)
     val recoveryRequests = MutableStateFlow(0L)
     private var frameWindowMs = SystemClock.elapsedRealtime()
     private var windowFrames = 0
+    private data class VideoUnit(val flags: Int, val pts: Long, val bytes: ByteArray)
+    private val decodeLock = Any()
+    private val videoQueue = ArrayBlockingQueue<VideoUnit>(12)
+    private val rxWindowBytes = AtomicLong()
     private val running = AtomicBoolean(false)
+    private val decodeWorker = Thread({
+        var lastMetricsMs = SystemClock.elapsedRealtime()
+        while (true) {
+            try {
+                val unit = videoQueue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+                if (unit != null && running.get()) {
+                    synchronized(decodeLock) {
+                        if (running.get()) processVideo(unit.flags, unit.pts, unit.bytes)
+                    }
+                }
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastMetricsMs >= 1000L) {
+                    val elapsed = (now - lastMetricsMs).coerceAtLeast(1L)
+                    receiveMbps.value = rxWindowBytes.getAndSet(0L) * 8.0 / elapsed / 1000.0
+                    decodeQueueDepth.value = videoQueue.size
+                    lastMetricsMs = now
+                }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            } catch (e: Exception) {
+                Log.w("NearCastVideo", "Decode worker recovered", e)
+            }
+        }
+    }, "NearCast-video-decode").apply { isDaemon = true; start() }
     @Volatile private var socket: Socket? = null
     @Volatile private var output: DataOutputStream? = null
     @Volatile private var decoder: AvcSurfaceDecoder? = null
@@ -330,6 +364,9 @@ class RemoteClient {
     fun connect(peer: NearbyPeer, pin: String) {
         close()
         running.set(true)
+        receivedFps.value = 0
+        renderedFps.value = 0
+        videoQueueOverflows.value = 0
         status.value = "正在连接 " + peer.name
         Thread({
             try {
@@ -385,9 +422,12 @@ class RemoteClient {
                             val newSize = Triple(w, h, mime)
                             if (dimensions != newSize) {
                                 dimensions = newSize
-                                codecConfigs.clear()
-                                configApplied = false
-                                needKeyframe = true
+                                synchronized(decodeLock) {
+                                    videoQueue.clear()
+                                    codecConfigs.clear()
+                                    configApplied = false
+                                    needKeyframe = true
+                                }
                                 videoSize.value = w to h
                                 codecName.value = when (mime) {
                                     "video/hevc" -> "H.265"
@@ -427,8 +467,20 @@ class RemoteClient {
         }, "NearCast-client").start()
     }
 
-    /** Shared handler for TCP and UDP video access units. */
+    /** Producer threads never wait for a MediaCodec buffer: UDP/TCP read stays responsive. */
     private fun receiveVideo(flags: Int, pts: Long, data: ByteArray) {
+        rxWindowBytes.addAndGet(data.size.toLong())
+        if (!running.get()) return
+        if (videoQueue.offer(VideoUnit(flags, pts, data))) return
+        // A decoder backlog implies loss of temporal reference continuity.
+        // Discard the stale GOP and request an IDR rather than accumulate latency.
+        videoQueueOverflows.value += 1
+        videoQueue.clear()
+        needKeyframe = true
+        requestSync()
+    }
+
+    private fun processVideo(flags: Int, pts: Long, data: ByteArray) {
                 if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                     if (codecConfigs.none { it.contentEquals(data) }) {
                         if (codecConfigs.size >= 4) codecConfigs.removeAt(0)
@@ -475,31 +527,53 @@ class RemoteClient {
                 }
     }
 
-    @Synchronized
+
     private fun createDecoderIfReady() {
-        val dims = dimensions ?: return
-        val target = surface ?: return
-        decoder?.close()
-        decoder = try { AvcSurfaceDecoder(target, dims.first, dims.second, dims.third) }
-        catch (e: Exception) {
-            status.value = "解码器不可用：" + (e.message ?: e.javaClass.simpleName)
-            null
+        synchronized(decodeLock) {
+            val dims = dimensions ?: return
+            val target = surface ?: return
+            videoQueue.clear()
+            decoder?.close()
+            decoder = try {
+                AvcSurfaceDecoder(target, dims.first, dims.second, dims.third) {
+                    countRenderedOutput()
+                }
+            } catch (e: Exception) {
+                status.value = "解码器不可用：" + (e.message ?: e.javaClass.simpleName)
+                null
+            }
+            needKeyframe = true
+            configApplied = false
         }
-        needKeyframe = true
-        configApplied = false
         requestSync()
     }
 
+    private var renderedWindowMs = SystemClock.elapsedRealtime()
+    private var renderedWindowFrames = 0
+    private val renderedStatsLock = Any()
+    private fun countRenderedOutput() = synchronized(renderedStatsLock) {
+        renderedWindowFrames++
+        val now = SystemClock.elapsedRealtime()
+        if (now - renderedWindowMs >= 1000L) {
+            renderedFps.value =
+                (renderedWindowFrames * 1000L / (now - renderedWindowMs).coerceAtLeast(1L)).toInt()
+            renderedWindowMs = now
+            renderedWindowFrames = 0
+        }
+    }
+
     fun attachSurface(value: Surface?) {
-        surface = value
-        if (value == null) {
-            // Backgrounding destroys SurfaceView's native window.
-            // The next surface MUST get its own codec and fresh IDR.
-            decoder?.close()
-            decoder = null
-            configApplied = false
-            needKeyframe = true
-        } else createDecoderIfReady()
+        synchronized(decodeLock) {
+            surface = value
+            if (value == null) {
+                videoQueue.clear()
+                decoder?.close()
+                decoder = null
+                configApplied = false
+                needKeyframe = true
+            }
+        }
+        if (value != null) createDecoderIfReady()
     }
 
     private fun requestSync() {
@@ -549,15 +623,19 @@ class RemoteClient {
         udpReceiver?.close()
         udpReceiver = null
         udpPort = 0
-        decoder?.close()
-        decoder = null
+        synchronized(decodeLock) {
+            videoQueue.clear()
+            decoder?.close()
+            decoder = null
+            codecConfigs.clear()
+            configApplied = false
+            needKeyframe = true
+        }
         audio?.close()
         audio = null
         dimensions = null
-        codecConfigs.clear()
-        configApplied = false
-        needKeyframe = true
         receivedFps.value = 0
+        renderedFps.value = 0
         connected.value = false
     }
 }

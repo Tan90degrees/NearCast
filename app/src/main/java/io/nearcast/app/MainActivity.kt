@@ -47,6 +47,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import io.nearcast.app.capture.CaptureService
 import io.nearcast.app.capture.VideoCodec
 import io.nearcast.app.capture.VideoResolution
+import io.nearcast.app.capture.VideoTransport
 import io.nearcast.app.network.NearbyPeer
 import io.nearcast.app.network.Wire
 import kotlin.math.hypot
@@ -131,6 +132,7 @@ private fun NearCastApp(
     val resolution by NearCastRuntime.resolution.collectAsState()
     val codec by NearCastRuntime.codec.collectAsState()
     val audioEnabled by NearCastRuntime.audioEnabled.collectAsState()
+    val transport by NearCastRuntime.transport.collectAsState()
     val audioActive by NearCastRuntime.audioActive.collectAsState()
     val dropped by server.droppedFrames.collectAsState()
     val message by NearCastRuntime.message.collectAsState()
@@ -233,7 +235,20 @@ private fun NearCastApp(
 
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("视频设置 · 共享前可调整", style = MaterialTheme.typography.titleMedium)
-            Text("编码协议", style = MaterialTheme.typography.labelLarge)
+            Text("网络传输", style = MaterialTheme.typography.labelLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                VideoTransport.entries.forEach { value ->
+                    FilterChip(
+                        selected = transport == value, enabled = !captureActive,
+                        onClick = { NearCastRuntime.transport.value = value },
+                        label = { Text(value.label) }
+                    )
+                }
+            }
+            Text("UDP 低延迟为实验模式，遇到丢包会请求关键帧；" +
+                "两种网络传输都尚未加密。",
+                style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+            Text("视频编码协议", style = MaterialTheme.typography.labelLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 VideoCodec.entries.forEach { value ->
                     FilterChip(
@@ -280,8 +295,8 @@ private fun NearCastApp(
                 "当前音频：" + if (audioActive) "传输中" else "未开启或不可捕获",
                 color = Aqua, style = MaterialTheme.typography.bodySmall
             )
-            Text("丢帧/GOP 重同步次数：$dropped · 当前为 TCP 测试传输，" +
-                "H.265/AV1 不可用时自动回退 H.264。",
+            Text("GOP 重同步次数：$dropped · 实际媒体模式：" +
+                transport.label + "。H.265/AV1 不可用时自动回退 H.264。",
                 style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
         }
 

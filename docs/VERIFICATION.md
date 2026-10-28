@@ -16,7 +16,7 @@
 9. 用高速摄像机分别量化 Glass-to-Glass、点击到画面反馈，而不是以编码器设定 FPS 代替真实 FPS。
 
 ## 已知待优化
-- 使用带身份认证和加密的低延迟 UDP/RTP/SRTP 而不是明文 TCP
+- 将实验性自定义 UDP 分片协议升级为带设备身份认证、可靠协商、加密以及更完善的丢包/拥塞控制的 UDP/RTP/SRTP；当前测试版的 TCP 和 UDP 都是明文
 - Codec-config 缓存/IDR 恢复在更多 OEM 编码器上的兼容验证
 - Opus 编码、音视频同步、低延迟缓冲、音频路由与蓝牙输出处理
 - 横竖屏动态重配与 Android 14+ 单次 MediaProjection VirtualDisplay 授权适配

@@ -50,6 +50,7 @@ import io.nearcast.app.capture.VideoCodec
 import io.nearcast.app.capture.VideoResolution
 import io.nearcast.app.capture.VideoTransport
 import io.nearcast.app.network.NearbyPeer
+import io.nearcast.app.network.HostServer
 import io.nearcast.app.network.Wire
 import kotlin.math.hypot
 
@@ -78,6 +79,12 @@ class MainActivity : ComponentActivity() {
                     launcher.launch(manager.createScreenCaptureIntent())
                 } else NearCastRuntime.message.value = "未授予系统声音采集权限，关闭音频开关后仍可共享视频"
             }
+            val p2pPermissionLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                if (granted) NearCastRuntime.wifiDirect?.start()
+                else NearCastRuntime.message.value = "未授予 Wi-Fi Direct 附近设备权限"
+            }
             MaterialTheme(colorScheme = darkColorScheme(
                 primary = Aqua, background = Dark, surface = Panel,
                 onSurface = Color(0xFFF0F8F7), onBackground = Color(0xFFF0F8F7)
@@ -98,6 +105,15 @@ class MainActivity : ComponentActivity() {
                     openAccessibility = {
                         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                     },
+                    enableDirect = {
+                        val permission = if (Build.VERSION.SDK_INT >= 33)
+                            Manifest.permission.NEARBY_WIFI_DEVICES
+                        else Manifest.permission.ACCESS_FINE_LOCATION
+                        if (ContextCompat.checkSelfPermission(this, permission) ==
+                            PackageManager.PERMISSION_GRANTED) {
+                            NearCastRuntime.wifiDirect?.start()
+                        } else p2pPermissionLauncher.launch(permission)
+                    },
                     openWriteSettings = {
                         startActivity(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS,
                             Uri.parse("package:" + packageName)))
@@ -113,6 +129,7 @@ class MainActivity : ComponentActivity() {
 private fun NearCastApp(
     requestShare: () -> Unit,
     openAccessibility: () -> Unit,
+    enableDirect: () -> Unit,
     openWriteSettings: () -> Unit,
     stopShare: () -> Unit
 ) {
@@ -120,7 +137,12 @@ private fun NearCastApp(
     val clipboard = LocalClipboardManager.current
     val server = NearCastRuntime.host ?: return
     val discoverer = NearCastRuntime.discovery ?: return
+    val direct = NearCastRuntime.wifiDirect ?: return
     val client = NearCastRuntime.client
+    val directStatus by direct.status.collectAsState()
+    val directPeers by direct.peers.collectAsState()
+    val directActive by direct.active.collectAsState()
+    val directLink by direct.link.collectAsState()
     val peers by discoverer.peers.collectAsState()
     val discoveryError by discoverer.error.collectAsState()
     val hostConnected by server.connected.collectAsState()
@@ -154,7 +176,7 @@ private fun NearCastApp(
     var pin by remember { mutableStateOf("") }
     var manual by remember { mutableStateOf(false) }
     var address by remember { mutableStateOf("") }
-    var port by remember { mutableStateOf("9020") }
+    var port by remember { mutableStateOf(server.port.toString()) }
 
     if (clientConnected) {
         RemoteViewer(onClose = { client.close() })
@@ -214,6 +236,69 @@ private fun NearCastApp(
                         style = MaterialTheme.typography.bodySmall, color = Color.LightGray
                     )
                     OutlinedButton(onClick = openAccessibility) { Text("设置控制权限") }
+                }
+            }
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Panel),
+            shape = RoundedCornerShape(20.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("无需路由器 · Wi-Fi Direct", style = MaterialTheme.typography.titleMedium)
+                Text("两台 Android 设备直接建立 Wi-Fi 链路。被控端创建直连组，" +
+                    "控制端搜索并加入；随后仍使用 NearCast 验证码配对。",
+                    style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                Text(directStatus, color = Aqua, style = MaterialTheme.typography.bodySmall)
+                if (!direct.isSupported()) {
+                    Text("当前设备没有 Wi-Fi Direct 系统支持。",
+                        color = MaterialTheme.colorScheme.error)
+                } else {
+                    if (!directActive) {
+                        Button(onClick = enableDirect) { Text("启用 Wi-Fi Direct") }
+                    } else {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = { direct.createHostGroup() },
+                                enabled = server.port == HostServer.DIRECT_PORT
+                            ) { Text("被控端建立直连") }
+                            OutlinedButton(onClick = { direct.discover() }) {
+                                Text("控制端搜索")
+                            }
+                        }
+                        if (server.port != HostServer.DIRECT_PORT) {
+                            Text("直连固定端口 " + HostServer.DIRECT_PORT +
+                                " 已被占用；本机监听 " + server.port +
+                                "，请重启/排查占用后再创建直连。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error)
+                        }
+                        directPeers.forEach { peer ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(peer.name, modifier = Modifier.weight(1f),
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                TextButton(onClick = { direct.join(peer) }) { Text("加入") }
+                            }
+                        }
+                        directLink?.let { link ->
+                            Text(
+                                if (link.groupOwner) "本机是组主机；另一台手机加入后输入本机配对码。"
+                                else "组主机 " + link.address + " · 无需 mDNS，直接连接",
+                                color = Color.LightGray, style = MaterialTheme.typography.bodySmall
+                            )
+                            if (!link.groupOwner) {
+                                Button(onClick = {
+                                    selectedPeer = NearbyPeer(
+                                        "Wi-Fi Direct 被控设备",
+                                        link.address, HostServer.DIRECT_PORT
+                                    )
+                                    pin = ""
+                                }) { Text("通过直连连接被控端") }
+                            }
+                            TextButton(onClick = { direct.disconnect() }) { Text("退出直连组") }
+                        }
+                    }
                 }
             }
         }

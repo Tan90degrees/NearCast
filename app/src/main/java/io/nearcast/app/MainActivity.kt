@@ -446,11 +446,28 @@ private fun RemoteViewer(onClose: () -> Unit) {
     val resync by client.recoveryRequests.collectAsState()
     val context = LocalContext.current
     val activity = context as? Activity
+    val receiverHz = activity?.display?.refreshRate ?: 0f
     var immersive by remember { mutableStateOf(false) }
 
     DisposableEffect(immersive) {
         val window = activity?.window
+        val previousModeId = window?.attributes?.preferredDisplayModeId ?: 0
         if (window != null) {
+            // Prefer the fastest available same-resolution display mode for the
+            // receiving viewer. This is a hint; Android can override it.
+            val display = activity.display
+            if (display != null) {
+                val currentMode = display.mode
+                val fastest = display.supportedModes
+                    .filter { it.physicalWidth == currentMode.physicalWidth &&
+                        it.physicalHeight == currentMode.physicalHeight }
+                    .maxByOrNull { it.refreshRate }
+                if (fastest != null && fastest.refreshRate > currentMode.refreshRate) {
+                    window.attributes = window.attributes.apply {
+                        preferredDisplayModeId = fastest.modeId
+                    }
+                }
+            }
             // Hide bars AND allow the SurfaceView to occupy their former space.
             WindowCompat.setDecorFitsSystemWindows(window, !immersive)
             val controller = WindowCompat.getInsetsController(window, window.decorView)
@@ -464,6 +481,7 @@ private fun RemoteViewer(onClose: () -> Unit) {
         }
         onDispose {
             window?.let {
+                it.attributes = it.attributes.apply { preferredDisplayModeId = previousModeId }
                 WindowCompat.setDecorFitsSystemWindows(it, true)
                 WindowCompat.getInsetsController(it, it.decorView)
                     .show(WindowInsetsCompat.Type.systemBars())
@@ -481,7 +499,8 @@ private fun RemoteViewer(onClose: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("远程屏幕 · $codec", fontWeight = FontWeight.Bold)
-                        Text(status + " · 解码提交 " + fps + " FPS / 解码输出 " +
+                        Text(status + " · 接收屏 " + receiverHz.toInt() + "Hz · 解码提交 " +
+                            fps + " FPS / 解码输出 " +
                             outputFps + " FPS · 总提交 " + received,
                             style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
                         Text("接收 " + "%.1f".format(rxMbps) + " Mbps · 解码排队 " +

@@ -160,7 +160,7 @@ class HostServer(private val context: Context) {
         private val requestSync: () -> Unit
     ) {
         private val open = AtomicBoolean(true)
-        private val pending = ArrayBlockingQueue<Packet>(48)
+        private val pending = ArrayBlockingQueue<Packet>(24)
         private var writer: Thread? = null
         private var header: Packet.Size? = null
         private val cachedConfig = ArrayList<Packet.Video>()
@@ -274,6 +274,10 @@ class RemoteClient {
     val videoSize = MutableStateFlow(9 to 16)
     val codecName = MutableStateFlow("H.264")
     val decodedFrames = MutableStateFlow(0L)
+    val receivedFps = MutableStateFlow(0)
+    val recoveryRequests = MutableStateFlow(0L)
+    private var frameWindowMs = SystemClock.elapsedRealtime()
+    private var windowFrames = 0
     private val running = AtomicBoolean(false)
     @Volatile private var socket: Socket? = null
     @Volatile private var output: DataOutputStream? = null
@@ -427,6 +431,14 @@ class RemoteClient {
                             requestSync()
                         } else {
                             decodedFrames.value += 1
+                            windowFrames++
+                            val now = SystemClock.elapsedRealtime()
+                            if (now - frameWindowMs >= 1000) {
+                                receivedFps.value = (windowFrames * 1000L /
+                                    (now - frameWindowMs).coerceAtLeast(1L)).toInt()
+                                frameWindowMs = now
+                                windowFrames = 0
+                            }
                         }
                     }
                 }
@@ -463,6 +475,7 @@ class RemoteClient {
         val now = SystemClock.elapsedRealtime()
         if (now - lastSyncMs < 300) return
         lastSyncMs = now
+        recoveryRequests.value += 1
         sendCommand(Wire.SYNC)
     }
 
@@ -513,6 +526,7 @@ class RemoteClient {
         codecConfigs.clear()
         configApplied = false
         needKeyframe = true
+        receivedFps.value = 0
         connected.value = false
     }
 }

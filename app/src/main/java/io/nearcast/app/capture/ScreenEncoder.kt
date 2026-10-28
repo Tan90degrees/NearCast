@@ -10,6 +10,7 @@ import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.SystemClock
+import kotlin.math.abs
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Surface
@@ -53,6 +54,7 @@ class ScreenEncoder(
     private val inputSurface: Surface
     private val display: VirtualDisplay
     private val outputThread: Thread
+    private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     val fps: Int
     val width: Int
     val height: Int
@@ -118,8 +120,20 @@ class ScreenEncoder(
     }
 
     private fun prepareEncoder(screenW: Int, screenH: Int, options: CaptureOptions): Prepared {
-        // Try selected codec first; H.264 is the compatibility fallback.
-        val mimeList = listOf(options.codec.mime, FALLBACK_MIME).distinct()
+        // The other phone advertises its decoder capabilities at pairing.
+        // A phone's AV1 decoding support is not proof it can encode AV1 with
+        // low latency. Prefer hardware AV1; otherwise fall back to HEVC.
+        val desired = if (options.codec == VideoCodec.AV1)
+            listOf(VideoCodec.AV1, VideoCodec.H265, VideoCodec.H264)
+        else if (options.codec == VideoCodec.H265)
+            listOf(VideoCodec.H265, VideoCodec.H264)
+        else listOf(VideoCodec.H264)
+        val mimeList = desired
+            .filter { io.nearcast.app.capture.CodecProbe.supports(host.peerDecoderMask.value, it) }
+            .map { it.mime }
+        if (mimeList.isEmpty()) {
+            throw IllegalStateException("接收手机未声明可用视频解码器，请两端安装相同新版")
+        }
         val rates = listOf(options.fps.coerceIn(30, 120), 90, 60, 30)
             .filter { it <= options.fps.coerceIn(30, 120) }.distinct().sortedDescending()
         val edges = when (options.resolution) {
@@ -131,7 +145,10 @@ class ScreenEncoder(
         var hasSurface = false
         for (mime in mimeList) {
             val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter {
-                it.isEncoder && it.supportedTypes.any { type -> type.equals(mime, true) }
+                it.isEncoder && it.supportedTypes.any { type -> type.equals(mime, true) } &&
+                    (mime != "video/av01" ||
+                        (Build.VERSION.SDK_INT >= 29 &&
+                            it.isHardwareAccelerated && !it.isSoftwareOnly))
             }.sortedByDescending {
                 if (Build.VERSION.SDK_INT >= 29 && it.isHardwareAccelerated) 1 else 0
             }
@@ -155,28 +172,42 @@ class ScreenEncoder(
                     if (w < 128 || h < 128 ||
                         !video.areSizeAndRateSupported(w, h, rate.toDouble())) continue
 
-                    val format = MediaFormat.createVideoFormat(mime, w, h).apply {
-                        setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                            MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                        setInteger(MediaFormat.KEY_BIT_RATE,
-                            if (rate > 60) 14_000_000 else 7_000_000)
-                        setInteger(MediaFormat.KEY_FRAME_RATE, rate)
-                        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                    }
-                    var candidate: MediaCodec? = null
-                    var surface: Surface? = null
-                    try {
-                        candidate = MediaCodec.createByCodecName(info.name)
-                        candidate.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                        surface = candidate.createInputSurface()
-                        candidate.start()
-                        Log.i(TAG, "Selected " + info.name + " " + w + "x" + h + "@" + rate)
-                        return Prepared(candidate, surface, info.name, w, h, rate, mime)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Rejected " + info.name + " " + w + "x" + h + "@" + rate, e)
-                        lastFailure = e
-                        try { surface?.release() } catch (_: Exception) {}
-                        try { candidate?.release() } catch (_: Exception) {}
+                    // Optional encoder latency hints can be ignored/rejected
+                    // by OEMs. Retry without them if configuration fails.
+                    for (lowLatency in listOf(true, false)) {
+                        val format = MediaFormat.createVideoFormat(mime, w, h).apply {
+                            setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                            setInteger(MediaFormat.KEY_BIT_RATE,
+                                if (rate > 60) 14_000_000 else 7_000_000)
+                            setInteger(MediaFormat.KEY_FRAME_RATE, rate)
+                            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                            if (lowLatency) {
+                                setInteger(MediaFormat.KEY_LATENCY, 1)
+                                if (Build.VERSION.SDK_INT >= 29)
+                                    setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                                setInteger(MediaFormat.KEY_OPERATING_RATE, rate)
+                            }
+                        }
+                        var candidate: MediaCodec? = null
+                        var surface: Surface? = null
+                        try {
+                            candidate = MediaCodec.createByCodecName(info.name)
+                            candidate.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                            surface = candidate.createInputSurface()
+                            candidate.start()
+                            host.selectedEncoder.value = info.name + " / " + mime +
+                                (if (lowLatency) " / 低延迟提示" else " / 标准配置")
+                            Log.i(TAG, "Selected " + info.name + " " + w + "x" + h +
+                                "@" + rate + " lowLatency=" + lowLatency)
+                            return Prepared(candidate, surface, info.name, w, h, rate, mime)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Rejected " + info.name + " " + w + "x" + h +
+                                "@" + rate + " latencyHint=" + lowLatency, e)
+                            lastFailure = e
+                            try { surface?.release() } catch (_: Exception) {}
+                            try { candidate?.release() } catch (_: Exception) {}
+                        }
                     }
                     }
                 }
@@ -220,6 +251,11 @@ class ScreenEncoder(
         var statsMs = SystemClock.elapsedRealtime()
         var frameCount = 0
         var bytesCount = 0L
+        var prevPts = -1L
+        var prevGap = 0L
+        var totalGap = 0L
+        var totalDeviation = 0L
+        var ptsSamples = 0
         while (running.get()) {
             try {
                 val index = codec.dequeueOutputBuffer(info, 10_000)
@@ -244,6 +280,17 @@ class ScreenEncoder(
                             if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
                                 frameCount++
                                 bytesCount += info.size.toLong()
+                                val pts = info.presentationTimeUs
+                                if (prevPts >= 0 && pts > prevPts) {
+                                    val gap = pts - prevPts
+                                    if (gap in 1L..500_000L) {
+                                        totalGap += gap
+                                        if (prevGap > 0) totalDeviation += abs(gap - prevGap)
+                                        ptsSamples++
+                                        prevGap = gap
+                                    }
+                                }
+                                prevPts = pts
                             }
                         }
                     } finally { codec.releaseOutputBuffer(index, false) }
@@ -253,6 +300,20 @@ class ScreenEncoder(
                     val ms = (now - statsMs).coerceAtLeast(1L)
                     host.encodedFps.value = (frameCount * 1000L / ms).toInt()
                     host.encodedMbps.value = bytesCount * 8.0 / ms / 1000.0
+                    host.frameIntervalMs.value =
+                        if (ptsSamples > 0) totalGap.toDouble() / ptsSamples / 1000.0 else 0.0
+                    host.frameCadenceJitterMs.value =
+                        if (ptsSamples > 1) totalDeviation.toDouble() / (ptsSamples - 1) / 1000.0
+                        else 0.0
+                    try {
+                        @Suppress("DEPRECATION")
+                        val physicalHz = wm.defaultDisplay.refreshRate
+                        host.physicalDisplayHz.value = physicalHz
+                        host.virtualDisplayHz.value = display.display?.refreshRate ?: 0f
+                    } catch (_: Exception) {}
+                    totalGap = 0L
+                    totalDeviation = 0L
+                    ptsSamples = 0
                     Log.d(TAG, "encoder actual fps=" + host.encodedFps.value +
                         " bitrate=" + host.encodedMbps.value + " Mbps; target=" + fps)
                     frameCount = 0

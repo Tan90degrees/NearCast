@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Use only on a trusted LAN. No old v1 protocol interop.
  */
 object Wire {
-    const val MAGIC = "NEARCAST/4"
+    const val MAGIC = "NEARCAST/5"
     const val SIZE = 1
     const val VIDEO = 2
     const val INPUT = 3
@@ -38,6 +38,7 @@ object Wire {
     const val UDP_PORT = 6
     const val PING = 7
     const val PONG = 8
+    const val SET_BITRATE = 9
     const val TAP = 1
     const val SWIPE = 2
     const val BACK = 3
@@ -65,6 +66,10 @@ class HostServer(private val context: Context) {
     val status = MutableStateFlow("等待同一 Wi-Fi 下的设备连接")
     val droppedFrames = MutableStateFlow(0L)
     val peerDecoderMask = MutableStateFlow(0)
+    /** Controller-requested encoder target, bounded independently by host safety cap. */
+    val bitrateCapMbps = MutableStateFlow(10)
+    val maxBitrateMbps = 60
+    @Volatile var onBitrateLimitChanged: ((Int) -> Unit)? = null
     val encodedFps = MutableStateFlow(0)
     val selectedEncoder = MutableStateFlow("尚未开始共享")
     val frameIntervalMs = MutableStateFlow(0.0)
@@ -138,6 +143,13 @@ class HostServer(private val context: Context) {
                                 RemoteInputService.dispatch(action, x1, y1, x2, y2, duration)
                         }
                         Wire.SYNC -> if (link === current) onNeedKeyframe?.invoke()
+                        Wire.SET_BITRATE -> {
+                            val requested = input.readInt().coerceIn(2, maxBitrateMbps)
+                            if (link === current) {
+                                bitrateCapMbps.value = requested
+                                onBitrateLimitChanged?.invoke(requested)
+                            }
+                        }
                         Wire.PING -> {
                             val sentTimeMs = input.readLong()
                             if (link === current) link.pong(sentTimeMs)
@@ -157,6 +169,8 @@ class HostServer(private val context: Context) {
                     current = null
                     peerDecoderMask.value = 0
                     onNeedKeyframe = null
+                    onBitrateLimitChanged = null
+                    bitrateCapMbps.value = 10
                     connected.value = false
                     status.value = "控制端已断开"
                     context.startService(CaptureService.stopIntent(context))
@@ -350,6 +364,7 @@ class RemoteClient {
     val decodeQueueDepth = MutableStateFlow(0)
     val videoQueueOverflows = MutableStateFlow(0L)
     val recoveryRequests = MutableStateFlow(0L)
+    val bitrateLimitMbps = MutableStateFlow(10)
     val controlRttMs = MutableStateFlow(0)
     val controlJitterMs = MutableStateFlow(0)
     private var previousRttMs = 0
@@ -428,6 +443,8 @@ class RemoteClient {
                 output = writer
                 connected.value = true
                 status.value = "已连接 · 等待对方开始共享"
+                // The host must receive this before or during its encoder startup.
+                setBitrateLimit(bitrateLimitMbps.value)
                 Thread({
                     while (running.get() && socket === s && !s.isClosed) {
                         val sentAt = SystemClock.elapsedRealtime()
@@ -668,6 +685,15 @@ class RemoteClient {
             } catch (_: Exception) {
                 if (socket === s) close()
             }
+        }
+    }
+
+    /** Callable from Compose UI; sends at most once per finished slider gesture. */
+    fun setBitrateLimit(mbps: Int) {
+        val requested = mbps.coerceIn(2, 60)
+        bitrateLimitMbps.value = requested
+        sendCommand(Wire.SET_BITRATE) {
+            output?.writeInt(requested)
         }
     }
 

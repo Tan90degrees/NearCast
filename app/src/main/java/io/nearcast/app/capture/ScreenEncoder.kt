@@ -116,6 +116,9 @@ class ScreenEncoder(
         }
         Log.i(TAG, "Using " + ready.name + " (" + mime + ") " + width + "x" + height + "@" + fps)
         host.onNeedKeyframe = { requestKeyframe() }
+        host.onBitrateLimitChanged = { cap -> changeBitrate(cap) }
+        // Handles a cap received before this encoder was created.
+        changeBitrate(host.bitrateCapMbps.value)
         outputThread = Thread({ drain() }, "NearCast-encoder").also { it.start() }
     }
 
@@ -179,7 +182,7 @@ class ScreenEncoder(
                             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                             setInteger(MediaFormat.KEY_BIT_RATE,
-                                if (rate > 60) 14_000_000 else 7_000_000)
+                                host.bitrateCapMbps.value.coerceIn(2, 60) * 1_000_000)
                             setInteger(MediaFormat.KEY_FRAME_RATE, rate)
                             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
                             if (lowLatency) {
@@ -224,6 +227,18 @@ class ScreenEncoder(
         try { ready.codec.stop() } catch (_: Exception) {}
         try { ready.codec.release() } catch (_: Exception) {}
         try { ready.surface.release() } catch (_: Exception) {}
+    }
+
+    private fun changeBitrate(mbps: Int) {
+        try {
+            codec.setParameters(android.os.Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE,
+                    mbps.coerceIn(2, host.maxBitrateMbps) * 1_000_000)
+            })
+            Log.i(TAG, "Controller bitrate target changed to " + mbps + " Mbps")
+        } catch (e: Exception) {
+            Log.w(TAG, "Codec rejected dynamic bitrate change", e)
+        }
     }
 
     fun requestKeyframe() {
@@ -333,6 +348,7 @@ class ScreenEncoder(
     fun stop() {
         if (!running.getAndSet(false)) return
         host.onNeedKeyframe = null
+        host.onBitrateLimitChanged = null
         try { display.release() } catch (_: Exception) {}
         try { outputThread.join(300) } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()

@@ -2,20 +2,24 @@ package io.nearcast.app.network
 
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.Build
+import android.util.Log
 import android.view.Surface
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Decode straight to a Surface; no Bitmap conversion or deliberate playback buffer. */
-class AvcSurfaceDecoder(surface: Surface, width: Int, height: Int) {
-    private val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+/** Video decoder with explicitly owned input/output lifecycle and MIME negotiation. */
+class AvcSurfaceDecoder(surface: Surface, width: Int, height: Int,
+                        mime: String = MediaFormat.MIMETYPE_VIDEO_AVC) {
+    private val codec = MediaCodec.createDecoderByType(mime)
     private val running = AtomicBoolean(true)
     private val outputThread: Thread
 
     init {
         try {
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
-            if (android.os.Build.VERSION.SDK_INT >= 30) {
-                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            val format = MediaFormat.createVideoFormat(mime, width, height)
+            if (Build.VERSION.SDK_INT >= 30) {
+                try { format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1) }
+                catch (_: Exception) {}
             }
             codec.configure(format, surface, null, 0)
             codec.start()
@@ -29,34 +33,41 @@ class AvcSurfaceDecoder(surface: Surface, width: Int, height: Int) {
                 try {
                     val index = codec.dequeueOutputBuffer(info, 5000)
                     if (index >= 0) codec.releaseOutputBuffer(index, true)
-                } catch (_: Exception) { break }
+                } catch (e: Exception) {
+                    if (running.get()) Log.w("NearCastDecoder", "Decode output failed", e)
+                    break
+                }
             }
         }, "NearCast-decoder").also { it.start() }
     }
 
-    fun queue(flags: Int, ptsUs: Long, data: ByteArray) {
-        if (!running.get()) return
-        try {
-            val index = codec.dequeueInputBuffer(1000)
-            if (index >= 0) {
-                val buffer = codec.getInputBuffer(index) ?: return
-                if (data.size > buffer.capacity()) {
-                    codec.queueInputBuffer(index, 0, 0, ptsUs, 0)
-                    return
-                }
-                buffer.clear()
-                buffer.put(data)
-                codec.queueInputBuffer(index, 0, data.size, ptsUs,
-                    flags and (MediaCodec.BUFFER_FLAG_CODEC_CONFIG or MediaCodec.BUFFER_FLAG_KEY_FRAME))
+    @Synchronized fun queue(flags: Int, ptsUs: Long, data: ByteArray): Boolean {
+        if (!running.get()) return false
+        return try {
+            val index = codec.dequeueInputBuffer(5000)
+            if (index < 0) return false
+            val buffer = codec.getInputBuffer(index)
+            if (buffer == null || data.size > buffer.capacity()) {
+                codec.queueInputBuffer(index, 0, 0, ptsUs, 0)
+                return false
             }
-        } catch (_: Exception) {}
+            buffer.clear()
+            buffer.put(data)
+            val usefulFlags = flags and
+                (MediaCodec.BUFFER_FLAG_CODEC_CONFIG or MediaCodec.BUFFER_FLAG_KEY_FRAME)
+            codec.queueInputBuffer(index, 0, data.size, ptsUs, usefulFlags)
+            true
+        } catch (e: Exception) {
+            if (running.get()) Log.w("NearCastDecoder", "Decode input failed", e)
+            false
+        }
     }
 
-    fun close() {
+    @Synchronized fun close() {
         if (!running.getAndSet(false)) return
-        // Stop the hardware codec only after the dequeue thread exits.
         if (Thread.currentThread() !== outputThread) {
-            try { outputThread.join(300) } catch (_: InterruptedException) {}
+            try { outputThread.join(300) }
+            catch (_: InterruptedException) { Thread.currentThread().interrupt() }
         }
         try { codec.stop() } catch (_: Exception) {}
         try { codec.release() } catch (_: Exception) {}

@@ -117,11 +117,12 @@ class ScreenEncoder(
             .filter { it <= requestedFps.coerceIn(30, 120) }.distinct().sortedDescending()
         var lastFailure: Exception? = null
         var hasSurface = false
-        for (maxEdge in listOf(1600, 1280, 960, 720)) {
-            val scale = minOf(1.0, maxEdge.toDouble() / maxOf(screenW, screenH))
-            val idealW = (screenW * scale).roundToInt()
-            val idealH = (screenH * scale).roundToInt()
-            for (rate in rates) {
+        // Prioritize requested FPS over picture resolution for interactive control.
+        for (rate in rates) {
+            for (maxEdge in listOf(1600, 1280, 960, 720)) {
+                val scale = minOf(1.0, maxEdge.toDouble() / maxOf(screenW, screenH))
+                val idealW = (screenW * scale).roundToInt()
+                val idealH = (screenH * scale).roundToInt()
                 for (info in codecs) {
                     val caps = try { info.getCapabilitiesForType(MIME) }
                     catch (e: Exception) { lastFailure = e; continue }

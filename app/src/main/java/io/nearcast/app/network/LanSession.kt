@@ -184,7 +184,10 @@ class HostServer(private val context: Context) {
                                 output.writeInt(item.udpPort)
                             }
                             is Packet.Video -> {
-                                if (useUdp) {
+                                // SPS/PPS/VPS/AV1 config must be reliable, even
+                                // when video data uses lossy UDP FastPath.
+                                val config = item.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
+                                if (useUdp && !config) {
                                     udpSender?.send(item.flags, item.ptsUs, item.bytes)
                                 } else {
                                     output.writeByte(Wire.VIDEO)

@@ -222,6 +222,11 @@ class HostServer(private val context: Context) {
 
         @Synchronized fun configureUdpDestination(address: java.net.InetAddress, port: Int) {
             udpSender?.setDestination(address, port)
+            // Initial encoder config/IDR may have been emitted before the
+            // controller advertised its UDP port. Start a NEW decodable GOP.
+            pending.clear()
+            header?.let { pending.offer(it) }
+            waitingKeyframe = true
         }
 
         @Synchronized fun sendFrame(flags: Int, ptsUs: Long, data: ByteArray) {

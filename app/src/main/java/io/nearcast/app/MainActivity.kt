@@ -45,6 +45,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.nearcast.app.capture.CaptureService
+import io.nearcast.app.capture.CodecProbe
 import io.nearcast.app.capture.VideoCodec
 import io.nearcast.app.capture.VideoResolution
 import io.nearcast.app.capture.VideoTransport
@@ -136,6 +137,12 @@ private fun NearCastApp(
     val audioActive by NearCastRuntime.audioActive.collectAsState()
     val dropped by server.droppedFrames.collectAsState()
     val encoderFps by server.encodedFps.collectAsState()
+    val activeEncoder by server.selectedEncoder.collectAsState()
+    val frameInterval by server.frameIntervalMs.collectAsState()
+    val frameJitter by server.frameCadenceJitterMs.collectAsState()
+    val peerMask by server.peerDecoderMask.collectAsState()
+    val codecResults by NearCastRuntime.codecResults.collectAsState()
+    val codecScanState by NearCastRuntime.codecScanState.collectAsState()
     val encoderMbps by server.encodedMbps.collectAsState()
     val wireMbps by server.wireMbps.collectAsState()
     val writerDepth by server.writerQueueDepth.collectAsState()
@@ -254,16 +261,57 @@ private fun NearCastApp(
             Text("UDP 低延迟为实验模式，遇到丢包会请求关键帧；" +
                 "两种网络传输都尚未加密。",
                 style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
-            Text("视频编码协议", style = MaterialTheme.typography.labelLarge)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("视频编码协议 · 本机自动检测", style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.weight(1f))
+                TextButton(
+                    enabled = !captureActive && !clientConnected,
+                    onClick = { NearCastRuntime.runCodecStartupTest() }
+                ) { Text("实测初始化") }
+            }
+            Text(codecScanState, color = Color.LightGray,
+                style = MaterialTheme.typography.bodySmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 VideoCodec.entries.forEach { value ->
+                    val local = codecResults.firstOrNull { it.codec == value }
+                    val localEncoderOk = local?.encoder != null && local.surfaceEncoder &&
+                        (value != VideoCodec.AV1 || local.hardwareEncoder) &&
+                        local.encodeStartup != false
+                    val peerOk = !hostConnected || CodecProbe.supports(peerMask, value)
                     FilterChip(
-                        selected = codec == value, enabled = !captureActive,
+                        selected = codec == value,
+                        enabled = !captureActive && localEncoderOk && peerOk,
                         onClick = { NearCastRuntime.codec.value = value },
                         label = { Text(value.label) }
                     )
                 }
             }
+            codecResults.forEach { item ->
+                val encoderText = item.encoder ?: "无编码器"
+                val decoderText = item.decoder ?: "无解码器"
+                val activeStatus = when {
+                    item.encodeStartup == true && item.decodeStartup == true -> "初始化通过"
+                    item.encodeStartup == false || item.decodeStartup == false -> "初始化失败"
+                    else -> "尚未实测初始化"
+                }
+                Text(item.codec.label + " · 编码 " + encoderText +
+                    (if (item.hardwareEncoder) " [HW]" else " [SW/未知]") +
+                    " · 解码 " + decoderText +
+                    (if (item.hardwareDecoder) " [HW]" else " [SW/未知]") +
+                    " · 720p120 编码声明 " + (if (item.encoding120) "支持" else "不支持") +
+                    " · " + activeStatus,
+                    style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                if (item.details.isNotEmpty()) Text(item.details,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error)
+            }
+            if (hostConnected) Text("接收端已声明支持：" +
+                VideoCodec.entries.filter { CodecProbe.supports(peerMask, it) }
+                    .joinToString { it.label },
+                color = Aqua, style = MaterialTheme.typography.bodySmall)
+            Text("实测初始化仅检查 configure/start，不代表持续 120 FPS 或低延迟。" +
+                "AV1 仅允许硬件编码，性能不佳推荐 H.265。",
+                style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
             Text("传输分辨率", style = MaterialTheme.typography.labelLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 VideoResolution.entries.forEach { value ->
@@ -301,15 +349,18 @@ private fun NearCastApp(
                 "当前音频：" + if (audioActive) "传输中" else "未开启或不可捕获",
                 color = Aqua, style = MaterialTheme.typography.bodySmall
             )
+            Text("实际编码器 " + activeEncoder,
+                style = MaterialTheme.typography.bodySmall, color = Aqua)
             Text("屏幕 " + sourceHz.toInt() + "Hz / 虚拟屏 " + virtualHz.toInt() +
                 "Hz · 实际编码 " + encoderFps + " FPS / " +
-                "%.1f".format(encoderMbps) + " Mbps",
+                "%.1f".format(encoderMbps) + " Mbps · 帧间隔 " +
+                "%.1f".format(frameInterval) + "±" + "%.1f".format(frameJitter) + "ms",
                 style = MaterialTheme.typography.bodySmall, color = Aqua)
             Text("网络写出 " + "%.1f".format(wireMbps) + " Mbps · 发送排队 " +
                 writerDepth + " 帧 · GOP 重同步 " + dropped,
                 style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
             Text("实际媒体模式：" +
-                transport.label + "。H.265/AV1 不可用时自动回退 H.264。",
+                transport.label + "。AV1 不可用时先回退 H.265，最终回退 H.264。",
                 style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
         }
 

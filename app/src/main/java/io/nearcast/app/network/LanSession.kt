@@ -405,11 +405,11 @@ class RemoteClient {
                     }
                 } else {
                     if (needKeyframe) {
-                        if (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME == 0) continue
+                        if (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME == 0) return
                         // On resume decoder was recreated, replay codec
                         // parameter sets before accepting the IDR.
                         val current = decoder
-                        if (current == null) continue
+                        if (current == null) return
                         if (!configApplied) {
                             var applied = true
                             codecConfigs.forEach {

@@ -370,6 +370,7 @@ class RemoteClient {
     private var previousRttMs = 0
     private var frameWindowMs = SystemClock.elapsedRealtime()
     private var windowFrames = 0
+    private var totalSubmittedFrames = 0L
     private data class VideoUnit(val flags: Int, val pts: Long, val bytes: ByteArray)
     private val decodeLock = Any()
     private val videoQueue = ArrayBlockingQueue<VideoUnit>(12)
@@ -423,6 +424,8 @@ class RemoteClient {
         receivedFps.value = 0
         renderedFps.value = 0
         videoQueueOverflows.value = 0
+        totalSubmittedFrames = 0L
+        decodedFrames.value = 0L
         status.value = "正在连接 " + peer.name
         Thread({
             val session = Socket()
@@ -599,12 +602,16 @@ class RemoteClient {
                             needKeyframe = true
                             requestSync()
                         } else {
-                            decodedFrames.value += 1
+                            // UI state is published once/second, not every
+                            // frame: 120 state writes/s otherwise trigger
+                            // heavyweight Compose recomposition and GC.
+                            totalSubmittedFrames++
                             windowFrames++
                             val now = SystemClock.elapsedRealtime()
                             if (now - frameWindowMs >= 1000) {
                                 receivedFps.value = (windowFrames * 1000L /
                                     (now - frameWindowMs).coerceAtLeast(1L)).toInt()
+                                decodedFrames.value = totalSubmittedFrames
                                 frameWindowMs = now
                                 windowFrames = 0
                             }

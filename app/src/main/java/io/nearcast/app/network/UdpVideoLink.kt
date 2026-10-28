@@ -3,7 +3,6 @@ package io.nearcast.app.network
 import android.media.MediaCodec
 import android.os.SystemClock
 import android.util.Log
-import java.io.ByteArrayOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -100,14 +99,17 @@ class UdpVideoReceiver(
 
     private fun readLoop() {
         val receive = ByteArray(1300)
+        val packet = DatagramPacket(receive, receive.size)
+        val input = ByteBuffer.wrap(receive).order(ByteOrder.BIG_ENDIAN)
+        var packetsUntilCleanup = 0
         while (running.get()) {
             try {
-                val packet = DatagramPacket(receive, receive.size)
+                packet.length = receive.size
                 socket.receive(packet)
                 lastTraffic = SystemClock.elapsedRealtime()
                 if (packet.length < HEADER) continue
-                val input = ByteBuffer.wrap(packet.data, packet.offset, packet.length)
-                    .order(ByteOrder.BIG_ENDIAN)
+                input.clear()
+                input.limit(packet.length)
                 if (input.int != MAGIC) continue
                 val id = input.int
                 val flags = input.int
@@ -118,12 +120,23 @@ class UdpVideoReceiver(
                 if (total !in 1..MAX_FRAGMENT_COUNT || index >= total ||
                     size > PAYLOAD || size != input.remaining()) continue
                 val now = SystemClock.elapsedRealtime()
-                val expired = pending.filterValues { now - it.startMs > 100 }.keys
-                if (expired.isNotEmpty()) {
-                    expired.forEach { pending.remove(it) }
-                    completed.clear()
-                    waitForKeyframe = true
-                    requestKeyframe()
+                // Scan once per 16 packets, not for every ~1KB fragment.
+                // Repeated HashMap traversals can dominate 120FPS streams.
+                if (++packetsUntilCleanup >= 16) {
+                    packetsUntilCleanup = 0
+                    var expired = false
+                    val iterator = pending.values.iterator()
+                    while (iterator.hasNext()) {
+                        if (now - iterator.next().startMs > 100) {
+                            iterator.remove()
+                            expired = true
+                        }
+                    }
+                    if (expired) {
+                        completed.clear()
+                        waitForKeyframe = true
+                        requestKeyframe()
+                    }
                 }
                 val assembly = pending.getOrPut(id) {
                     Assembly(flags, pts, now, arrayOfNulls(total))
@@ -146,9 +159,16 @@ class UdpVideoReceiver(
                 }
                 if (assembly.received != total) continue
                 pending.remove(id)
-                val output = ByteArrayOutputStream(total * PAYLOAD)
-                assembly.parts.forEach { output.write(it ?: ByteArray(0)) }
-                val bytes = output.toByteArray()
+                // One allocation/copy per frame; previously ByteArrayOutputStream
+                // allocated another full-sized array during toByteArray().
+                val bytes = ByteArray(assembly.parts.sumOf { it?.size ?: 0 })
+                var writeAt = 0
+                assembly.parts.forEach { part ->
+                    if (part != null) {
+                        System.arraycopy(part, 0, bytes, writeAt, part.size)
+                        writeAt += part.size
+                    }
+                }
                 when {
                     flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0 ->
                         onVideo(flags, pts, bytes)
@@ -184,9 +204,17 @@ class UdpVideoReceiver(
                     }
                 }
             } catch (_: SocketTimeoutException) {
-                if (SystemClock.elapsedRealtime() - lastTraffic > 800) {
-                    requestKeyframe()
-                    lastTraffic = SystemClock.elapsedRealtime()
+                // No new frames on a static screen is normal. Do NOT spam
+                // IDR every 800ms while idle: that creates unnecessary
+                // bandwidth spikes and interrupts decoder frame pacing.
+                if (pending.isNotEmpty()) {
+                    val now = SystemClock.elapsedRealtime()
+                    if (pending.values.any { now - it.startMs > 100 }) {
+                        pending.clear()
+                        completed.clear()
+                        waitForKeyframe = true
+                        requestKeyframe()
+                    }
                 }
             } catch (e: Exception) {
                 if (running.get()) Log.w("NearCastUDP", "Receiver stopped", e)

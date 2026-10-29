@@ -64,6 +64,11 @@ class HostServer(private val context: Context) {
     val port: Int = server.localPort
     val connected = MutableStateFlow(false)
     val status = MutableStateFlow("等待同一 Wi-Fi 下的设备连接")
+    val lastDisconnectReason = MutableStateFlow("暂无")
+    private data class StreamInfo(val w: Int, val h: Int, val mime: String,
+                                  val transport: VideoTransport)
+    @Volatile private var streamInfo: StreamInfo? = null
+    private val linkEpoch = AtomicLong(0L)
     val droppedFrames = MutableStateFlow(0L)
     val peerDecoderMask = MutableStateFlow(0)
     /** Controller-requested encoder target, bounded independently by host safety cap. */
@@ -124,11 +129,20 @@ class HostServer(private val context: Context) {
                 wireMbps.value = mbps
             })
             current = link
+            linkEpoch.incrementAndGet()
             peerDecoderMask.value = advertisedDecoderMask
             connected.value = true
             status.value = "已配对 · 请点击共享屏幕"
             socket.soTimeout = 0
             link.startWriter()
+            // If TCP was interrupted briefly, the Android MediaProjection
+            // remains active through the reconnection grace period.
+            // Attach the NEW transport to the same encoder without seeking a
+            // second one-use screen-capture consent token.
+            streamInfo?.let {
+                link.sendSize(it.w, it.h, it.mime, it.transport)
+                if (it.transport == VideoTransport.TCP) onNeedKeyframe?.invoke()
+            }
             try {
                 while (running.get() && !socket.isClosed) {
                     when (input.readUnsignedByte()) {
@@ -168,12 +182,26 @@ class HostServer(private val context: Context) {
                 if (current === link) {
                     current = null
                     peerDecoderMask.value = 0
-                    onNeedKeyframe = null
-                    onBitrateLimitChanged = null
-                    bitrateCapMbps.value = 10
                     connected.value = false
-                    status.value = "控制端已断开"
-                    context.startService(CaptureService.stopIntent(context))
+                    val disconnectedEpoch = linkEpoch.incrementAndGet()
+                    val reason = if (socket.isClosed) "控制通道已关闭" else "控制通道已中断"
+                    lastDisconnectReason.value = reason
+                    if (streamInfo != null) {
+                        status.value = "连接中断，保留采集 15 秒等待客户端恢复"
+                        Thread({
+                            try { Thread.sleep(15_000) }
+                            catch (_: InterruptedException) { return@Thread }
+                            if (linkEpoch.get() == disconnectedEpoch && current == null &&
+                                streamInfo != null) {
+                                Log.w("NearCastHost", "Reconnect grace expired; stop capture")
+                                lastDisconnectReason.value = "15 秒内未能重连"
+                                try { context.startService(CaptureService.stopIntent(context)) }
+                                catch (e: Exception) {
+                                    Log.e("NearCastHost", "Cannot stop capture after grace", e)
+                                }
+                            }
+                        }, "NearCast-reconnect-grace").apply { isDaemon = true; start() }
+                    } else status.value = "控制端已断开"
                 }
                 link.close()
             }
@@ -184,7 +212,15 @@ class HostServer(private val context: Context) {
     }
 
     fun sendSize(width: Int, height: Int, mime: String, mode: VideoTransport) {
+        streamInfo = StreamInfo(width, height, mime, mode)
         current?.sendSize(width, height, mime, mode)
+    }
+
+    fun clearStream() {
+        streamInfo = null
+        onNeedKeyframe = null
+        onBitrateLimitChanged = null
+        bitrateCapMbps.value = 10
     }
     fun sendFrame(flags: Int, ptsUs: Long, data: ByteArray) {
         current?.sendFrame(flags, ptsUs, data)
@@ -195,6 +231,8 @@ class HostServer(private val context: Context) {
         running.set(false)
         current?.close()
         current = null
+        streamInfo = null
+        linkEpoch.incrementAndGet()
         try { server.close() } catch (_: Exception) {}
     }
 

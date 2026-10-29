@@ -31,7 +31,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Use only on a trusted LAN. No old v1 protocol interop.
  */
 object Wire {
-    const val MAGIC = "NEARCAST/5"
+    const val MAGIC = "NEARCAST/6"
+    const val AUTH_OK = 0
+    const val AUTH_BAD_PIN = 1
+    const val AUTH_BUSY = 2
+    const val AUTH_VERSION = 3
     const val SIZE = 1
     const val VIDEO = 2
     const val INPUT = 3
@@ -116,11 +120,17 @@ class HostServer(private val context: Context) {
                 input.readUTF().toByteArray(), pin.toByteArray()
             )
             val advertisedDecoderMask = input.readInt() and 0x7
-            val accepted = matchesVersion && matchesPin && current == null
-            output.writeBoolean(accepted)
+            val result = when {
+                !matchesVersion -> Wire.AUTH_VERSION
+                !matchesPin -> Wire.AUTH_BAD_PIN
+                current != null -> Wire.AUTH_BUSY
+                else -> Wire.AUTH_OK
+            }
+            output.writeByte(result)
             output.flush()
-            if (!accepted) {
-                Thread.sleep(350)
+            if (result != Wire.AUTH_OK) {
+                // A stale TCP session still being cleaned up is NOT an
+                // incorrect PIN. Let the controller retry automatically.
                 socket.close()
                 return
             }
@@ -577,9 +587,22 @@ class RemoteClient {
                 writer.writeUTF(pin)
                 writer.writeInt(CodecProbe.decoderMask(CodecProbe.scan()))
                 writer.flush()
-                if (!reader.readBoolean()) {
-                    rejection = true
-                    throw SecurityException("配对码错误或通信版本不兼容")
+                when (reader.readUnsignedByte()) {
+                    Wire.AUTH_OK -> Unit
+                    Wire.AUTH_BUSY ->
+                        throw IllegalStateException("服务端正在释放旧连接，即将重试")
+                    Wire.AUTH_BAD_PIN -> {
+                        rejection = true
+                        throw SecurityException("六位配对码错误")
+                    }
+                    Wire.AUTH_VERSION -> {
+                        rejection = true
+                        throw SecurityException("两台设备的 NearCast 版本不一致")
+                    }
+                    else -> {
+                        rejection = true
+                        throw SecurityException("握手返回了无效的状态码")
+                    }
                 }
                 s.soTimeout = 3000
                 output = writer

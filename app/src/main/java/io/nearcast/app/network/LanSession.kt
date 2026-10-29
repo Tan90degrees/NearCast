@@ -208,145 +208,199 @@ class HostServer(private val context: Context) {
         data class Pong(val timestamp: Long) : Packet()
     }
 
+    /**
+     * Split video and reliable control. UDP fragmentation must NEVER block
+     * PONG/codec configuration/audio and cannot terminate the TCP session.
+     */
     private class HostLink(
         val socket: Socket, private val output: DataOutputStream,
         private val requestSync: () -> Unit,
         private val onNetworkStats: (Int, Double) -> Unit
     ) {
         private val open = AtomicBoolean(true)
-        private val pending = ArrayBlockingQueue<Packet>(12)
-        private var writer: Thread? = null
-        private var header: Packet.Size? = null
-        private val cachedConfig = ArrayList<Packet.Video>()
+        private val priority = ArrayBlockingQueue<Packet>(32)
+        private val audioQueue = ArrayBlockingQueue<Packet.Audio>(12)
+        private val tcpVideo = ArrayBlockingQueue<Packet.Video>(12)
+        private val udpVideo = ArrayBlockingQueue<Packet.Video>(12)
         private var udpSender: UdpVideoSender? = null
-        private var useUdp = false
-        private var waitingKeyframe = false
-        private var statsMs = SystemClock.elapsedRealtime()
-        private var windowBytes = 0L
+        private var usingUdp = false
+        private var udpReady = false
+        private var streamHeader: Packet.Size? = null
+        private val cachedConfig = ArrayList<Packet.Video>()
+        private var awaitingIdr = true
+        private var lastRecoveryMs = 0L
+        private var writer: Thread? = null
+        private var udpWriter: Thread? = null
 
         fun startWriter() {
             writer = Thread({
+                var lastStatsMs = SystemClock.elapsedRealtime()
+                var sentBytes = 0L
                 try {
                     while (open.get()) {
-                        val item = pending.poll(250, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        // An urgent PONG/config cannot sit behind an entire
+                        // GOP of encoded packets on the application queue.
+                        val packet = priority.poll()
+                            ?: audioQueue.poll()
+                            ?: tcpVideo.poll(5, java.util.concurrent.TimeUnit.MILLISECONDS)
                             ?: continue
-                        when (item) {
+                        when (packet) {
                             is Packet.Size -> {
                                 output.writeByte(Wire.SIZE)
-                                output.writeInt(item.width)
-                                output.writeInt(item.height)
-                                output.writeUTF(item.mime)
-                                output.writeBoolean(item.udp)
-                                output.writeInt(item.udpPort)
+                                output.writeInt(packet.width)
+                                output.writeInt(packet.height)
+                                output.writeUTF(packet.mime)
+                                output.writeBoolean(packet.udp)
+                                output.writeInt(packet.udpPort)
+                                sentBytes += 32L
                             }
                             is Packet.Video -> {
-                                // SPS/PPS/VPS/AV1 config must be reliable, even
-                                // when video data uses lossy UDP FastPath.
-                                val config = item.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
-                                if (useUdp && !config) {
-                                    udpSender?.send(item.flags, item.ptsUs, item.bytes)
-                                } else {
-                                    output.writeByte(Wire.VIDEO)
-                                    output.writeInt(item.flags)
-                                    output.writeLong(item.ptsUs)
-                                    output.writeInt(item.bytes.size)
-                                    output.write(item.bytes)
-                                }
+                                output.writeByte(Wire.VIDEO)
+                                output.writeInt(packet.flags)
+                                output.writeLong(packet.ptsUs)
+                                output.writeInt(packet.bytes.size)
+                                output.write(packet.bytes)
+                                sentBytes += packet.bytes.size.toLong()
                             }
                             is Packet.Audio -> {
                                 output.writeByte(Wire.AUDIO)
-                                output.writeInt(item.bytes.size)
-                                output.write(item.bytes)
+                                output.writeInt(packet.bytes.size)
+                                output.write(packet.bytes)
+                                sentBytes += packet.bytes.size.toLong()
                             }
                             is Packet.Pong -> {
                                 output.writeByte(Wire.PONG)
-                                output.writeLong(item.timestamp)
+                                output.writeLong(packet.timestamp)
+                                sentBytes += 9L
                             }
                         }
-                        windowBytes += when (item) {
-                            is Packet.Video -> item.bytes.size.toLong()
-                            is Packet.Audio -> item.bytes.size.toLong()
-                            is Packet.Size -> 32L
-                            is Packet.Pong -> 9L
-                        }
                         val now = SystemClock.elapsedRealtime()
-                        if (now - statsMs >= 1000L) {
-                            onNetworkStats(pending.size,
-                                windowBytes * 8.0 / (now - statsMs) / 1000.0)
-                            statsMs = now
-                            windowBytes = 0L
+                        if (now - lastStatsMs >= 1000L) {
+                            onNetworkStats(tcpVideo.size + udpVideo.size,
+                                sentBytes * 8.0 / (now - lastStatsMs).coerceAtLeast(1L) / 1000.0)
+                            sentBytes = 0L
+                            lastStatsMs = now
                         }
                     }
                 } catch (e: Exception) {
-                    if (open.get()) Log.w("NearCastHost", "Network writer failed", e)
-                } finally { close() }
-            }, "NearCast-video-writer").apply { start() }
+                    if (open.get()) Log.e("NearCastHost", "TCP connection failed", e)
+                } finally {
+                    close()
+                }
+            }, "NearCast-reliable-writer").apply { isDaemon = true; start() }
+
+            udpWriter = Thread({
+                var failures = 0
+                while (open.get()) {
+                    try {
+                        val packet = udpVideo.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+                            ?: continue
+                        val sender = synchronized(this) {
+                            if (usingUdp && udpReady) udpSender else null
+                        } ?: continue
+                        sender.send(packet.flags, packet.ptsUs, packet.bytes)
+                        failures = 0
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return@Thread
+                    } catch (e: Exception) {
+                        if (!open.get()) break
+                        failures++
+                        Log.w("NearCastUDP", "UDP video send failure #" + failures +
+                            " (TCP control remains connected)", e)
+                        synchronized(this) { resetVideoQueue() }
+                        if (failures == 1 || failures % 8 == 0) requestSync()
+                        try { Thread.sleep(40L.coerceAtMost(failures.toLong() * 10L)) }
+                        catch (_: InterruptedException) { return@Thread }
+                    }
+                }
+            }, "NearCast-udp-writer").apply { isDaemon = true; start() }
         }
 
         @Synchronized fun sendSize(width: Int, height: Int, mime: String, mode: VideoTransport) {
             udpSender?.close()
-            useUdp = mode == VideoTransport.UDP
-            udpSender = if (useUdp) UdpVideoSender() else null
-            val next = Packet.Size(width, height, mime, useUdp, udpSender?.localPort ?: 0)
-            header = next
+            usingUdp = mode == VideoTransport.UDP
+            udpReady = !usingUdp
+            udpSender = if (usingUdp) UdpVideoSender() else null
+            val header = Packet.Size(width, height, mime, usingUdp,
+                udpSender?.localPort ?: 0)
+            streamHeader = header
             cachedConfig.clear()
-            pending.clear()
-            waitingKeyframe = true
-            pending.offer(next)
+            priority.clear()
+            audioQueue.clear()
+            tcpVideo.clear()
+            udpVideo.clear()
+            awaitingIdr = true
+            priority.offer(header)
         }
 
         @Synchronized fun configureUdpDestination(address: java.net.InetAddress, port: Int) {
+            if (!usingUdp) return
             udpSender?.setDestination(address, port)
-            // Initial encoder config/IDR may have been emitted before the
-            // controller advertised its UDP port. Start a NEW decodable GOP.
-            pending.clear()
-            header?.let { pending.offer(it) }
-            waitingKeyframe = true
-        }
-
-        @Synchronized fun sendFrame(flags: Int, ptsUs: Long, data: ByteArray) {
-            if (!open.get() || data.size > Wire.MAX_FRAME) return
-            val pkt = Packet.Video(flags, ptsUs, data)
-            if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                if (cachedConfig.none { it.bytes.contentEquals(data) }) {
-                    if (cachedConfig.size >= 4) cachedConfig.removeAt(0)
-                    cachedConfig.add(pkt)
-                }
-                if (!waitingKeyframe) pending.offer(pkt)
-                return
-            }
-            val key = flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
-            if (waitingKeyframe) {
-                if (!key) return
-                cachedConfig.forEach { pending.offer(it) }
-                waitingKeyframe = false
-            }
-            if (pending.offer(pkt)) return
-
-            // TCP can stall under Wi-Fi jitter. Never block MediaCodec drain.
-            // Drop the queued GOP and request a fresh IDR. Any P-frame after a
-            // missing reference is discarded until that IDR arrives.
-            pending.clear()
-            header?.let { pending.offer(it) }
-            waitingKeyframe = true
+            udpReady = true
+            udpVideo.clear()
+            awaitingIdr = true
+            // Decoder must receive codec parameters before the new IDR.
+            cachedConfig.forEach { priority.offer(it) }
             requestSync()
         }
 
-        fun pong(timestampMs: Long) {
-            if (open.get()) pending.offer(Packet.Pong(timestampMs))
+        @Synchronized fun sendFrame(flags: Int, ptsUs: Long, data: ByteArray) {
+            if (!open.get() || streamHeader == null || data.size > Wire.MAX_FRAME) return
+            val packet = Packet.Video(flags, ptsUs, data)
+            if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                if (cachedConfig.none { it.bytes.contentEquals(data) }) {
+                    if (cachedConfig.size >= 4) cachedConfig.removeAt(0)
+                    cachedConfig.add(packet)
+                }
+                priority.offer(packet)
+                return
+            }
+            if (usingUdp && !udpReady) return
+            val keyFrame = flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
+            if (awaitingIdr) {
+                if (!keyFrame) return
+                cachedConfig.forEach { priority.offer(it) }
+                awaitingIdr = false
+            }
+            val queue = if (usingUdp) udpVideo else tcpVideo
+            if (queue.offer(packet)) return
+            // Drop only the obsolete queued GOP; do not block MediaCodec or
+            // close the whole connection on transient pressure.
+            resetVideoQueue()
+            requestSync()
         }
 
-        @Synchronized fun sendAudio(data: ByteArray) {
-            if (!open.get() || data.size > Wire.MAX_AUDIO) return
-            // Audio is best-effort; never evict video for it.
-            pending.offer(Packet.Audio(data))
+        @Synchronized private fun resetVideoQueue() {
+            tcpVideo.clear()
+            udpVideo.clear()
+            awaitingIdr = true
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastRecoveryMs < 500L) return
+            lastRecoveryMs = now
+        }
+
+        fun pong(timestampMs: Long) {
+            if (open.get()) priority.offer(Packet.Pong(timestampMs))
+        }
+
+        fun sendAudio(data: ByteArray) {
+            if (open.get() && data.size <= Wire.MAX_AUDIO) {
+                // Best effort PCM; never forces the loss of the video GOP.
+                audioQueue.offer(Packet.Audio(data))
+            }
         }
 
         fun close() {
             if (!open.getAndSet(false)) return
-            pending.clear()
-            udpSender?.close()
-            udpSender = null
+            priority.clear()
+            audioQueue.clear()
+            tcpVideo.clear()
+            udpVideo.clear()
+            synchronized(this) {
+                udpSender?.close()
+                udpSender = null
+            }
             try { socket.close() } catch (_: Exception) {}
         }
     }

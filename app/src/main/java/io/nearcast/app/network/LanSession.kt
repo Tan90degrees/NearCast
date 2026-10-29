@@ -13,6 +13,7 @@ import io.nearcast.app.input.RemoteInputService
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.net.SocketTimeoutException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -104,6 +105,7 @@ class HostServer(private val context: Context) {
     private fun authenticate(socket: Socket) {
         try {
             socket.tcpNoDelay = true
+            socket.keepAlive = true
             socket.sendBufferSize = 128 * 1024
             socket.soTimeout = 5000
             val input = DataInputStream(socket.getInputStream())
@@ -133,7 +135,7 @@ class HostServer(private val context: Context) {
             peerDecoderMask.value = advertisedDecoderMask
             connected.value = true
             status.value = "已配对 · 请点击共享屏幕"
-            socket.soTimeout = 0
+            socket.soTimeout = 3000
             link.startWriter()
             // If TCP was interrupted briefly, the Android MediaProjection
             // remains active through the reconnection grace period.
@@ -144,8 +146,17 @@ class HostServer(private val context: Context) {
                 if (it.transport == VideoTransport.TCP) onNeedKeyframe?.invoke()
             }
             try {
+                var lastClientContactMs = SystemClock.elapsedRealtime()
                 while (running.get() && !socket.isClosed) {
-                    when (input.readUnsignedByte()) {
+                    val opcode = try {
+                        input.readUnsignedByte()
+                    } catch (_: SocketTimeoutException) {
+                        if (SystemClock.elapsedRealtime() - lastClientContactMs > 12_000L)
+                            throw SocketTimeoutException("12 秒未收到客户端心跳")
+                        continue
+                    }
+                    lastClientContactMs = SystemClock.elapsedRealtime()
+                    when (opcode) {
                         Wire.INPUT -> {
                             val action = input.readInt()
                             val x1 = input.readFloat()
@@ -346,8 +357,8 @@ class HostServer(private val context: Context) {
                         failures++
                         Log.w("NearCastUDP", "UDP video send failure #" + failures +
                             " (TCP control remains connected)", e)
-                        synchronized(this) { resetVideoQueue() }
-                        if (failures == 1 || failures % 8 == 0) requestSync()
+                        val needSync = synchronized(this) { resetVideoQueue() }
+                        if (needSync && (failures == 1 || failures % 8 == 0)) requestSync()
                         try { Thread.sleep(40L.coerceAtMost(failures.toLong() * 10L)) }
                         catch (_: InterruptedException) { return@Thread }
                     }
@@ -405,17 +416,17 @@ class HostServer(private val context: Context) {
             if (queue.offer(packet)) return
             // Drop only the obsolete queued GOP; do not block MediaCodec or
             // close the whole connection on transient pressure.
-            resetVideoQueue()
-            requestSync()
+            if (resetVideoQueue()) requestSync()
         }
 
-        @Synchronized private fun resetVideoQueue() {
+        @Synchronized private fun resetVideoQueue(): Boolean {
             tcpVideo.clear()
             udpVideo.clear()
             awaitingIdr = true
             val now = SystemClock.elapsedRealtime()
-            if (now - lastRecoveryMs < 500L) return
+            if (now - lastRecoveryMs < 600L) return false
             lastRecoveryMs = now
+            return true
         }
 
         fun pong(timestampMs: Long) {
@@ -542,6 +553,7 @@ class RemoteClient {
                 socket = s
                 s.connect(InetSocketAddress(peer.address, peer.port), 4000)
                 s.tcpNoDelay = true
+                s.keepAlive = true
                 s.soTimeout = 5000
                 val writer = DataOutputStream(s.getOutputStream())
                 val reader = DataInputStream(s.getInputStream())
@@ -553,7 +565,7 @@ class RemoteClient {
                     rejection = true
                     throw SecurityException("配对码错误或通信版本不兼容")
                 }
-                s.soTimeout = 0
+                s.soTimeout = 3000
                 output = writer
                 connected.value = true
                 reconnecting.value = false
@@ -572,8 +584,17 @@ class RemoteClient {
                         catch (_: InterruptedException) { break }
                     }
                 }, "NearCast-control-ping").apply { isDaemon = true; start() }
+                var lastServerContactMs = SystemClock.elapsedRealtime()
                 while (running.get()) {
-                    when (reader.readUnsignedByte()) {
+                    val opcode = try {
+                        reader.readUnsignedByte()
+                    } catch (_: SocketTimeoutException) {
+                        if (SystemClock.elapsedRealtime() - lastServerContactMs > 11_000L)
+                            throw SocketTimeoutException("11 秒未收到服务端心跳回复")
+                        continue
+                    }
+                    lastServerContactMs = SystemClock.elapsedRealtime()
+                    when (opcode) {
                         Wire.SIZE -> {
                             val w = reader.readInt()
                             val h = reader.readInt()

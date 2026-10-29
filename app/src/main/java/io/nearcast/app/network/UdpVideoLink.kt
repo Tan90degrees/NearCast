@@ -24,6 +24,8 @@ private const val MAGIC = 0x4E435632
 private const val HEADER = 26
 private const val PAYLOAD = 1174
 private const val MAX_FRAGMENT_COUNT = 2048
+private const val FRAGMENTS_PER_PAUSE = 16
+private const val PAUSE_NS = 120_000L
 
 class UdpVideoSender {
     private val socket = DatagramSocket(0).apply { sendBufferSize = 512 * 1024 }
@@ -61,6 +63,13 @@ class UdpVideoSender {
             System.arraycopy(bytes, start, buffer, HEADER, size)
             packet.length = HEADER + size
             socket.send(packet)
+            // Small capped pacing prevents a single large IDR from
+            // overflowing the Wi-Fi chip's short-term Tx descriptor queue.
+            // UDP sending has its own thread, so this cannot block control
+            // heartbeats or the encoder drain.
+            if (count > 32 && i > 0 && i % FRAGMENTS_PER_PAUSE == 0) {
+                java.util.concurrent.locks.LockSupport.parkNanos(PAUSE_NS)
+            }
         }
     }
 
@@ -84,7 +93,7 @@ class UdpVideoReceiver(
     private val socket = DatagramSocket(0).apply {
         connect(serverAddress, serverPort)
         soTimeout = 120
-        receiveBufferSize = 512 * 1024
+        receiveBufferSize = 2 * 1024 * 1024
     }
     val localPort: Int get() = socket.localPort
     private val running = AtomicBoolean(true)
@@ -194,7 +203,7 @@ class UdpVideoReceiver(
                         }
                         if (completed.isNotEmpty()) {
                             val oldest = completed.values.first().receivedAtMs
-                            if (completed.size > 4 || now - oldest > 25) {
+                            if (completed.size > 4 || now - oldest > 40) {
                                 completed.clear()
                                 pending.clear()
                                 waitForKeyframe = true
@@ -209,7 +218,7 @@ class UdpVideoReceiver(
                 // bandwidth spikes and interrupts decoder frame pacing.
                 if (pending.isNotEmpty()) {
                     val now = SystemClock.elapsedRealtime()
-                    if (pending.values.any { now - it.startMs > 100 }) {
+                    if (pending.values.any { now - it.startMs > 130 }) {
                         pending.clear()
                         completed.clear()
                         waitForKeyframe = true

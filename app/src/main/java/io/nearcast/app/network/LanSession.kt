@@ -145,6 +145,7 @@ class HostServer(private val context: Context) {
                 link.sendSize(it.w, it.h, it.mime, it.transport)
                 if (it.transport == VideoTransport.TCP) onNeedKeyframe?.invoke()
             }
+            var reasonDetail = "对端主动断开或 TCP 连接关闭"
             try {
                 var lastClientContactMs = SystemClock.elapsedRealtime()
                 while (running.get() && !socket.isClosed) {
@@ -189,14 +190,18 @@ class HostServer(private val context: Context) {
                         else -> throw IllegalArgumentException("Unknown control packet")
                     }
                 }
+            } catch (e: Exception) {
+                reasonDetail = e.javaClass.simpleName + ": " +
+                    (e.message ?: "没有详细异常")
+                throw e
             } finally {
                 if (current === link) {
                     current = null
                     peerDecoderMask.value = 0
                     connected.value = false
                     val disconnectedEpoch = linkEpoch.incrementAndGet()
-                    val reason = if (socket.isClosed) "控制通道已关闭" else "控制通道已中断"
-                    lastDisconnectReason.value = reason
+                    lastDisconnectReason.value = reasonDetail
+                    Log.w("NearCastHost", "Disconnect cause: " + reasonDetail)
                     if (streamInfo != null) {
                         status.value = "连接中断，保留采集 15 秒等待客户端恢复"
                         Thread({

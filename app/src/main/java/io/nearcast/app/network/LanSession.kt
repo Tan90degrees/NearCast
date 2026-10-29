@@ -291,6 +291,7 @@ class HostServer(private val context: Context) {
         private var lastRecoveryMs = 0L
         private var writer: Thread? = null
         private var udpWriter: Thread? = null
+        private val udpWritten = AtomicLong(0L)
 
         fun startWriter() {
             writer = Thread({
@@ -302,8 +303,8 @@ class HostServer(private val context: Context) {
                         // GOP of encoded packets on the application queue.
                         val packet = priority.poll()
                             ?: audioQueue.poll()
-                            ?: tcpVideo.poll(5, java.util.concurrent.TimeUnit.MILLISECONDS)
-                            ?: continue
+                            ?: tcpVideo.poll(20, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        if (packet != null) {
                         when (packet) {
                             is Packet.Size -> {
                                 output.writeByte(Wire.SIZE)
@@ -334,10 +335,12 @@ class HostServer(private val context: Context) {
                                 sentBytes += 9L
                             }
                         }
+                        }
                         val now = SystemClock.elapsedRealtime()
                         if (now - lastStatsMs >= 1000L) {
+                            val totalBytes = sentBytes + udpWritten.getAndSet(0L)
                             onNetworkStats(tcpVideo.size + udpVideo.size,
-                                sentBytes * 8.0 / (now - lastStatsMs).coerceAtLeast(1L) / 1000.0)
+                                totalBytes * 8.0 / (now - lastStatsMs).coerceAtLeast(1L) / 1000.0)
                             sentBytes = 0L
                             lastStatsMs = now
                         }
@@ -359,6 +362,7 @@ class HostServer(private val context: Context) {
                             if (usingUdp && udpReady) udpSender else null
                         } ?: continue
                         sender.send(packet.flags, packet.ptsUs, packet.bytes)
+                        udpWritten.addAndGet(packet.bytes.size.toLong())
                         failures = 0
                     } catch (e: InterruptedException) {
                         Thread.currentThread().interrupt()

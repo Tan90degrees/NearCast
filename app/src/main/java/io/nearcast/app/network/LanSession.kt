@@ -135,7 +135,8 @@ class HostServer(private val context: Context) {
             linkEpoch.incrementAndGet()
             peerDecoderMask.value = advertisedDecoderMask
             connected.value = true
-            status.value = "已配对 · 请点击共享屏幕"
+            status.value = if (streamInfo != null) "控制端已重新连接，正在恢复视频"
+                else "已配对 · 请点击共享屏幕"
             socket.soTimeout = 3000
             link.startWriter()
             // If TCP was interrupted briefly, the Android MediaProjection

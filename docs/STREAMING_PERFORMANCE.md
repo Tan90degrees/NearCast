@@ -57,3 +57,37 @@ References:
 - [ ] Harden session authentication/encryption before use on any non-isolated network.
 
 **This is a development build, not a stable Moonlight-equivalent implementation.**
+
+
+## v0.6 Stability: unexpected disconnects and low-FPS bursts
+
+### Verified code issues and changes
+- Previous implementation multiplexed UDP video sends, reliable TCP packet writes, audio chunks, heartbeat replies and codec metadata onto **one writer**. A large UDP IDR fragmented into many tiny datagrams could block TCP PONG, introducing apparent RTT jitter. UDP traffic now uses a dedicated writer/queue, while TCP prioritizes control/config packets. TCP-only mode still has head-of-line blocking and is intended for compatibility.
+- Previous UDP Socket send exception escaped the shared writer and **closed the TCP connection**. Now UDP failures are handled as *video-stream recovery*, while TCP control remains connected.
+- The previous host immediately stopped CaptureService on a TCP disconnect, requiring fresh user MediaProjection consent even when Wi-Fi recovered. Host now retains the capture for **15 seconds**, then safely stops the existing foreground service if still disconnected. A new client attaches to the existing stream metadata, receives codec configuration and requests a fresh IDR.
+- The controller now retries at bounded intervals up to five times following an unexpected transport failure. Explicit user disconnect and incorrect PIN cancel retries. A TCP heartbeat watchdog detects half-open/stalled sockets after approximately 11/12 seconds. This does **not** avoid capture interruption if Android terminates MediaProjection itself, or if the app is force stopped.
+- Encoder IDR and runtime bitrate calls now use their own single-threaded codec control executor and are limited so networking callbacks cannot synchronously block MediaCodec output.
+- UDP sender sends large keyframes in micro-bursts of 16 datagrams, with a very short inter-burst pause. The receiver requests a larger socket buffer and modestly longer reorder/fragment-loss tolerance. These are heuristics pending true network measurement, not packet loss recovery or congestion control.
+- Android low-latency Wi-Fi performance hint is scoped to active capture/viewer sessions. Per Android's official API it applies only while connected to an AP, the screen is on, and the app is foreground. It **is not guaranteed to affect Wi-Fi Direct**, and may consume more battery or reduce throughput.
+
+### Debugging a remaining dropout
+In the **诊断** tab, record:
+- Host: actual encoded FPS, Mbps, writer queue depth, GOP re-syncs, *last host TCP disconnect reason*.
+- Controller: decoded input/output FPS, receive Mbps, control RTT/jitter, queued frames, IDR requests, *last client disconnect reason* and reconnect state.
+
+Read actual Android logs:
+\`\`\`bash
+adb logcat -v time -s NearCastHost NearCastClient NearCastUDP NearCastEncoder NearCastDecoder NearCastCapture NearCastWifi
+\`\`\`
+
+Interpretation:
+- **Encoder FPS steady, UDP recovery/IDR rises, TCP RTT steady** → video fragment loss, receiver backlog or UDP send pressure; use H.265 720p/60, then compare 6/10/15 Mbps.
+- **TCP RTT spikes then SocketTimeoutException/EOF** → actual control channel failure, network interface switch, routing or OS Wi-Fi policy; automatic reconnect may restore within 15 sec.
+- **TCP stable, decoded output FPS falls / decoder queue fills** → hardware decoder or Surface/UI rendering queue; reduce resolution/bitrate and toggle minimum-latency presentation.
+- **Host source/capture FPS falls to 60 while link RTT stable** → OS/application refresh/capture policy, not network bandwidth.
+
+Do not claim root cause is definitively known until a two-device Logcat trace or time-correlated performance report is available.
+
+### Safety
+- The experimental NearCast protocol is still plaintext, PIN is not cryptographic device authentication. Testing only on user-authorized trusted isolated networks, never a public or sensitive network.
+- Avoid hiding failures by silently extending queues indefinitely. If a session remains unresponsive past the recovery window, show the reason and let the user initiate a fresh screen-capture consent.

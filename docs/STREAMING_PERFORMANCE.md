@@ -17,7 +17,7 @@
 
 ## Controller bitrate control
 
-Protocol: \`NEARCAST/5\` (both devices must use the same APK). New reliable control message:
+Protocol: \`NEARCAST/6\` (both devices must use the same APK). New reliable control message:
 - \`SET_BITRATE=9\`, followed by signed big-endian int Mbps.
 - Host validates/clamps to **2–60 Mbps**. Malicious/untrusted clients cannot request unbounded targets.
 - The host applies \`MediaCodec.setParameters(Bundle(PARAMETER_KEY_VIDEO_BITRATE = Mbps × 1,000,000))\` to the active encoder.
@@ -48,7 +48,7 @@ References:
 
 ## Real-device acceptance tests (not yet completed)
 
-- [ ] Verify Android CI APK build and both-device pairing using \`NEARCAST/5\`.
+- [ ] Verify Android CI APK build and both-device pairing using \`NEARCAST/6\`.
 - [ ] From viewer choose **2, 6, 10, 20, 40 Mbps**, confirm host's target changes immediately and hardware encoder output Mbps responds on a changing scene.
 - [ ] Compare lowest-latency vs ordered rendering in a 60Hz-source/120Hz-display case and a genuine 120FPS case.
 - [ ] Compare 15-minute Wi-Fi and Wi-Fi Direct sustained sessions: encoder output PTS jitter, client RTT variance, queue overflows, IDR rates, decoding FPS, thermal decline.
@@ -91,3 +91,7 @@ Do not claim root cause is definitively known until a two-device Logcat trace or
 ### Safety
 - The experimental NearCast protocol is still plaintext, PIN is not cryptographic device authentication. Testing only on user-authorized trusted isolated networks, never a public or sensitive network.
 - Avoid hiding failures by silently extending queues indefinitely. If a session remains unresponsive past the recovery window, show the reason and let the user initiate a fresh screen-capture consent.
+
+
+### v0.6 handshake recovery correctness
+The server now returns distinct outcomes: `AUTH_OK`, `AUTH_BAD_PIN`, `AUTH_BUSY` (previous stale TCP session has not yet closed), and `AUTH_VERSION`. If busy, the controller retries rather than incorrectly treating it as a permanent bad PIN and abandoning recovery. This requires **both devices on NEARCAST/6**.

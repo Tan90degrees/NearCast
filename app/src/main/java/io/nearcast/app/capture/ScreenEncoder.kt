@@ -17,6 +17,8 @@ import android.view.Surface
 import android.view.WindowManager
 import io.nearcast.app.network.HostServer
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
 /**
@@ -50,6 +52,10 @@ class ScreenEncoder(
     )
 
     private val running = AtomicBoolean(true)
+    private val codecControl = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "NearCast-codec-control").apply { isDaemon = true }
+    }
+    private val lastSyncMs = AtomicLong(0L)
     private val codec: MediaCodec
     private val inputSurface: Surface
     private val display: VirtualDisplay
@@ -230,25 +236,37 @@ class ScreenEncoder(
     }
 
     private fun changeBitrate(mbps: Int) {
-        try {
-            codec.setParameters(android.os.Bundle().apply {
-                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE,
-                    mbps.coerceIn(2, host.maxBitrateMbps) * 1_000_000)
-            })
-            Log.i(TAG, "Controller bitrate target changed to " + mbps + " Mbps")
-        } catch (e: Exception) {
-            Log.w(TAG, "Codec rejected dynamic bitrate change", e)
+        if (!running.get()) return
+        codecControl.execute {
+            if (!running.get()) return@execute
+            try {
+                codec.setParameters(android.os.Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE,
+                        mbps.coerceIn(2, host.maxBitrateMbps) * 1_000_000)
+                })
+                Log.i(TAG, "Runtime bitrate target=" + mbps + " Mbps")
+            } catch (e: Exception) {
+                Log.w(TAG, "Codec refused runtime bitrate change", e)
+            }
         }
     }
 
     fun requestKeyframe() {
-        try {
-            val params = android.os.Bundle().apply {
-                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+        if (!running.get()) return
+        val now = SystemClock.elapsedRealtime()
+        val last = lastSyncMs.get()
+        if (now - last < 450L || !lastSyncMs.compareAndSet(last, now)) return
+        // Asynchronous control prevents codec.setParameters() from blocking
+        // the encoder drain and the TCP/UDP packet receiver.
+        codecControl.execute {
+            if (!running.get()) return@execute
+            try {
+                codec.setParameters(android.os.Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                })
+            } catch (e: Exception) {
+                Log.w(TAG, "Request IDR failed", e)
             }
-            codec.setParameters(params)
-        } catch (e: Exception) {
-            Log.w(TAG, "Request IDR failed", e)
         }
     }
 
@@ -349,6 +367,7 @@ class ScreenEncoder(
         if (!running.getAndSet(false)) return
         host.onNeedKeyframe = null
         host.onBitrateLimitChanged = null
+        codecControl.shutdownNow()
         try { display.release() } catch (_: Exception) {}
         try { outputThread.join(300) } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()

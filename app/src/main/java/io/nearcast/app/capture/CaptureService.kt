@@ -146,6 +146,7 @@ class CaptureService : Service() {
         audioCapture = null
         encoder?.stop()
         encoder = null
+        NearCastRuntime.host?.clearStream()
         try { projection?.unregisterCallback(callback) } catch (_: Exception) {}
         try { projection?.stop() } catch (_: Exception) {}
         projection = null

@@ -59,6 +59,9 @@ internal fun NearCastHome(
 
     val connected by client.connected.collectAsState()
     val clientStatus by client.status.collectAsState()
+    val reconnecting by client.reconnecting.collectAsState()
+    val disconnectReason by client.disconnectReason.collectAsState()
+    val hostDisconnectReason by host.lastDisconnectReason.collectAsState()
     val hostConnected by host.connected.collectAsState()
     val hostStatus by host.status.collectAsState()
     val sharing by NearCastRuntime.captureActive.collectAsState()
@@ -134,6 +137,13 @@ internal fun NearCastHome(
                 .padding(horizontal = 16.dp, vertical = 18.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
+            if (reconnecting) {
+                InfoCard {
+                    Text("连接短暂中断 · 正在自动恢复", color = highlight)
+                    Text(clientStatus, style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = { client.close() }) { Text("取消自动重连") }
+                }
+            }
             if (error != null) {
                 InfoCard {
                     Text(error ?: "", color = MaterialTheme.colorScheme.error)
@@ -373,6 +383,8 @@ internal fun NearCastHome(
                         Text("实际编码器：" + encoderName,
                             color = Color.LightGray, style = MaterialTheme.typography.bodySmall)
                         Text("接收端设定码率目标 " + effectiveBitrate + " Mbps")
+                        Text("最后一次控制端断开：" + disconnectReason)
+                        Text("最后一次被控端断开：" + hostDisconnectReason)
                         Text("客户端状态：" + clientStatus,
                             color = Color.LightGray, style = MaterialTheme.typography.bodySmall)
                         Text("音频：" + if (audioActive) "采集中" else "未采集")

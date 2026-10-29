@@ -6,6 +6,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import io.nearcast.app.capture.CaptureService
+import io.nearcast.app.NearCastRuntime
 import io.nearcast.app.capture.VideoTransport
 import io.nearcast.app.capture.CodecProbe
 import io.nearcast.app.capture.VideoCodec
@@ -211,8 +212,13 @@ class HostServer(private val context: Context) {
                                 streamInfo != null) {
                                 Log.w("NearCastHost", "Reconnect grace expired; stop capture")
                                 lastDisconnectReason.value = "15 秒内未能重连"
-                                try { context.startService(CaptureService.stopIntent(context)) }
-                                catch (e: Exception) {
+                                try {
+                                    // stopService is legal for an existing FGS
+                                    // even when the caller is in background.
+                                    context.stopService(
+                                        android.content.Intent(context, CaptureService::class.java)
+                                    )
+                                } catch (e: Exception) {
                                     Log.e("NearCastHost", "Cannot stop capture after grace", e)
                                 }
                             }
@@ -573,6 +579,7 @@ class RemoteClient {
                 s.soTimeout = 3000
                 output = writer
                 connected.value = true
+                NearCastRuntime.wifiLatencyGuard?.acquire("viewer")
                 reconnecting.value = false
                 disconnectReason.value = "暂无"
                 status.value = if (attempt > 0) "已自动重连 · 等待恢复视频"
@@ -890,6 +897,7 @@ class RemoteClient {
 
     private fun closeTransport() {
         running.set(false)
+        NearCastRuntime.wifiLatencyGuard?.release("viewer")
         try { socket?.close() } catch (_: Exception) {}
         socket = null
         output = null

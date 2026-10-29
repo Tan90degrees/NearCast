@@ -71,6 +71,7 @@ class CaptureService : Service() {
                 )
             } else startForeground(NOTIFICATION_ID, notification)
 
+            NearCastRuntime.wifiLatencyGuard?.acquire("capture")
             stage = "读取屏幕授权"
             val code = intent.getIntExtra(RESULT_CODE, 0)
             @Suppress("DEPRECATION")
@@ -140,6 +141,7 @@ class CaptureService : Service() {
     override fun onDestroy() {
         NearCastRuntime.dimScreen?.restore()
         NearCastRuntime.dimActive.value = false
+        NearCastRuntime.wifiLatencyGuard?.release("capture")
         NearCastRuntime.captureActive.value = false
         NearCastRuntime.audioActive.value = false
         audioCapture?.stop()

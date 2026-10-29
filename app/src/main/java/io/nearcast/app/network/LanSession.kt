@@ -511,17 +511,32 @@ class RemoteClient {
         Thread(runnable, "NearCast-input-writer").apply { isDaemon = true }
     }
 
+    private val generation = AtomicLong(0L)
+    val reconnecting = MutableStateFlow(false)
+    val disconnectReason = MutableStateFlow("暂无")
+
     fun connect(peer: NearbyPeer, pin: String) {
-        close()
-        running.set(true)
+        val token = generation.incrementAndGet()
+        connectAttempt(peer, pin, 0, token)
+    }
+
+    private fun connectAttempt(peer: NearbyPeer, pin: String,
+                               attempt: Int, token: Long) {
+        Thread({
+            if (generation.get() != token) return@Thread
+            closeTransport()
+            if (generation.get() != token) return@Thread
+            running.set(true)
+            reconnecting.value = attempt > 0
         receivedFps.value = 0
         renderedFps.value = 0
         videoQueueOverflows.value = 0
         totalSubmittedFrames = 0L
         decodedFrames.value = 0L
         status.value = "正在连接 " + peer.name
-        Thread({
             val session = Socket()
+            var rejection = false
+            var failureDetail = "连接关闭"
             try {
                 val s = session
                 socket = s
@@ -534,11 +549,17 @@ class RemoteClient {
                 writer.writeUTF(pin)
                 writer.writeInt(CodecProbe.decoderMask(CodecProbe.scan()))
                 writer.flush()
-                if (!reader.readBoolean()) throw IllegalStateException("配对码错误或版本不兼容")
+                if (!reader.readBoolean()) {
+                    rejection = true
+                    throw SecurityException("配对码错误或通信版本不兼容")
+                }
                 s.soTimeout = 0
                 output = writer
                 connected.value = true
-                status.value = "已连接 · 等待对方开始共享"
+                reconnecting.value = false
+                disconnectReason.value = "暂无"
+                status.value = if (attempt > 0) "已自动重连 · 等待恢复视频"
+                    else "已连接 · 等待对方开始共享"
                 // The host must receive this before or during its encoder startup.
                 setBitrateLimit(bitrateLimitMbps.value)
                 Thread({
@@ -638,15 +659,36 @@ class RemoteClient {
                     }
                 }
             } catch (e: Exception) {
-                if (running.get() && socket === session) {
-                    status.value = e.message ?: "连接中断"
-                }
+                failureDetail = e.javaClass.simpleName + ": " +
+                    (e.message ?: "连接中断")
+                Log.w("NearCastClient", "Session lost (attempt=" + attempt + ")", e)
             } finally {
-                // A previous reader MUST NOT tear down a newly connected session.
-                if (socket === session) close()
-                else try { session.close() } catch (_: Exception) {}
+                if (socket === session && generation.get() == token) {
+                    val canRetry = !rejection && attempt < 5 &&
+                        running.get() && generation.get() == token
+                    disconnectReason.value = failureDetail
+                    closeTransport()
+                    reconnecting.value = canRetry
+                    if (canRetry) {
+                        val delayMs = minOf(2500L, 400L * (attempt + 1))
+                        status.value = "连接中断：" + failureDetail +
+                            "；正在重连 " + (attempt + 1) + "/5"
+                        Thread({
+                            try { Thread.sleep(delayMs) }
+                            catch (_: InterruptedException) { return@Thread }
+                            if (generation.get() == token) {
+                                connectAttempt(peer, pin, attempt + 1, token)
+                            }
+                        }, "NearCast-retry").apply { isDaemon = true; start() }
+                    } else {
+                        status.value = if (rejection) "配对拒绝：" + failureDetail
+                            else "连接已断开：" + failureDetail
+                    }
+                } else {
+                    try { session.close() } catch (_: Exception) {}
+                }
             }
-        }, "NearCast-client").start()
+        }, "NearCast-client-attempt-$attempt").apply { isDaemon = true; start() }
     }
 
     /** Producer threads never wait for a MediaCodec buffer: UDP/TCP read stays responsive. */
@@ -814,6 +856,13 @@ class RemoteClient {
     }
 
     fun close() {
+        generation.incrementAndGet() // Explicit user disconnect cancels retries.
+        reconnecting.value = false
+        closeTransport()
+        status.value = "已手动断开"
+    }
+
+    private fun closeTransport() {
         running.set(false)
         try { socket?.close() } catch (_: Exception) {}
         socket = null

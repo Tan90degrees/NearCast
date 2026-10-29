@@ -86,8 +86,10 @@ class UdpVideoReceiver(
         val flags: Int,
         val ptsUs: Long,
         val startMs: Long,
-        val parts: Array<ByteArray?>,
-        var received: Int = 0
+        val buffer: ByteArray,
+        val present: BooleanArray,
+        var received: Int = 0,
+        var finalSize: Int = 0
     )
 
     private val socket = DatagramSocket(0).apply {
@@ -147,16 +149,21 @@ class UdpVideoReceiver(
                         requestKeyframe()
                     }
                 }
+                if (index < total - 1 && size != PAYLOAD) continue
                 val assembly = pending.getOrPut(id) {
-                    Assembly(flags, pts, now, arrayOfNulls(total))
+                    // Allocate once per *frame*, never once per 1174-byte
+                    // fragment. This substantially reduces allocation pressure
+                    // for 60/90/120 FPS Wi-Fi streaming.
+                    Assembly(flags, pts, now,
+                        ByteArray(total * PAYLOAD), BooleanArray(total))
                 }
-                if (assembly.parts.size != total || assembly.flags != flags || assembly.ptsUs != pts)
-                    continue
-                if (assembly.parts[index] == null) {
-                    val part = ByteArray(size)
-                    input.get(part)
-                    assembly.parts[index] = part
+                if (assembly.present.size != total || assembly.flags != flags ||
+                    assembly.ptsUs != pts) continue
+                if (!assembly.present[index]) {
+                    input.get(assembly.buffer, index * PAYLOAD, size)
+                    assembly.present[index] = true
                     assembly.received++
+                    if (index == total - 1) assembly.finalSize = size
                 }
                 // Bound memory under corrupt/reordered datagrams.
                 if (pending.size > 12) {
@@ -168,16 +175,9 @@ class UdpVideoReceiver(
                 }
                 if (assembly.received != total) continue
                 pending.remove(id)
-                // One allocation/copy per frame; previously ByteArrayOutputStream
-                // allocated another full-sized array during toByteArray().
-                val bytes = ByteArray(assembly.parts.sumOf { it?.size ?: 0 })
-                var writeAt = 0
-                assembly.parts.forEach { part ->
-                    if (part != null) {
-                        System.arraycopy(part, 0, bytes, writeAt, part.size)
-                        writeAt += part.size
-                    }
-                }
+                val frameSize = (total - 1) * PAYLOAD + assembly.finalSize
+                if (frameSize <= 0 || frameSize > Wire.MAX_FRAME) continue
+                val bytes = assembly.buffer.copyOf(frameSize)
                 when {
                     flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0 ->
                         onVideo(flags, pts, bytes)
